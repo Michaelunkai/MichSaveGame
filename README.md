@@ -44,13 +44,15 @@ python -m pip install -r requirements.txt
 
 If PowerShell blocks scripts, use the one-liner below with `-ExecutionPolicy Bypass`.
 
-## Run the polished desktop GUI
+## Run the premium local app
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "F:\study\Windows\Applications\Gaming\SaveData\Backup\Tools\Python\universal-game-save-guardian\scripts\run-game-save-guardian.ps1" gui
 ```
 
-In the GUI:
+`gui` now launches the premium browser-based local dashboard at `http://127.0.0.1:8765/app` and serves local-only APIs for discovery, backup selection, restore preview, and backup history. This replaced the old default-looking Tk form because the product-quality target is a polished modern command center.
+
+In the app:
 
 1. Confirm or change the backup destination.
 2. Press **Discover Saves**.

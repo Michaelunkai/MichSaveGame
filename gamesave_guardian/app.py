@@ -2,7 +2,7 @@
 #!/usr/bin/env python3
 """Universal Game Save Guardian: CLI, Tk GUI, and tiny web UI for game save backup/restore."""
 from __future__ import annotations
-import argparse, base64, dataclasses, datetime as dt, fnmatch, hashlib, html, json, os, queue, re, shutil, sys, tarfile, tempfile, threading, time, webbrowser
+import argparse, base64, dataclasses, datetime as dt, fnmatch, hashlib, html, json, os, queue, re, secrets, shutil, sys, tarfile, tempfile, threading, time, urllib.parse, urllib.request, webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterable, Optional
@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BUNDLED_MANIFEST = ROOT / "data" / "ludusavi_manifest.yaml"
 CONFIG_DIR = Path(os.environ.get("APPDATA") or Path.home() / ".config") / "UniversalGameSaveGuardian"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+API_TOKEN = secrets.token_urlsafe(24)
 
 @dataclasses.dataclass
 class Source:
@@ -374,8 +375,11 @@ def all_save_roots()->list[Path]:
 def save_like(files:list[str], dirname:str='')->bool:
     exts={'.sav','.save','.slot','.profile','.sgf','.ess','.rpgsave','.sol'}
     low=dirname.lower()
-    if low in {'save','saves','saved games','savegames','profiles','remote','userdata'}: return True
-    return any(Path(f).suffix.lower() in exts or 'save' in f.lower() or 'profile' in f.lower() for f in files[:80])
+    if low in {'save','saves','saved games','savegames','savegame','savedata','save data'}: return True
+    # Folders named "Profiles", "Remote" and "User Data" are common in browsers,
+    # launchers and developer tools, so only treat them as saves when the payload
+    # itself contains save-shaped files.
+    return any(Path(f).suffix.lower() in exts or 'save' in f.lower() for f in files[:80])
 
 def source_score(s:Source)->int:
     score=30; low=str(s.path).lower(); reason=s.reason.lower()
@@ -445,9 +449,9 @@ def discover_all_games(refresh=False, max_depth=5)->list[dict]:
         except Exception: pass
     games={}
     def add(title, platform, source:Source, install_path=None, manifest_hit=False):
-        blacklist={'docker','powershell','windowspowershell','windows','mozilla','internet-explorer','claude','netlify','everything','flingtrainer','microsoft','google','chrome','edge','nodejs','python','npm','hermes'}
+        blacklist={'docker','powershell','windowspowershell','windows','mozilla','internet-explorer','claude','netlify','everything','flingtrainer','microsoft','google','chrome','edge','nodejs','python','npm','hermes','user-data','user','user-pinned','content','lib','output','man','start-menu','inetcache','oneauth','saved','config','dist','title','player','ludusavi','token-optimizer','savedgames','goldberg-steamemu-saves','gse-saves','steamemu','rune','codex','nvidia-corporation','wlanservice','wlansvc','updateframework','firefox','snapshots','chocolatey','chocolateyinstall','cosmos','cef','deno','migrationdata','open-interpreter','jszip','startup64','agents','artificial-intelligence','artificial_intelligence','test'}
         slug=safe_slug(title).lower()
-        if slug in blacklist or any(x in slug for x in ['docker','powershell','mozilla','internet-explorer','chrome','microsoft','python']):
+        if slug in blacklist or re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', slug) or any(x in slug for x in ['docker','powershell','mozilla','internet-explorer','chrome','microsoft','python','cache','start-menu','user-data']):
             return
         key=slug
         rec=games.setdefault(key, {'title':title,'platform':platform,'install_path':install_path,'manifest_hit':manifest_hit,'sources':[]})
@@ -470,7 +474,7 @@ def discover_all_games(refresh=False, max_depth=5)->list[dict]:
                 if visited>6000 or time.time()-started>root_budget:
                     dirs[:]=[]; break
                 p=Path(dirpath); depth=len(p.relative_to(root).parts)
-                dirs[:]=[d for d in dirs if d.lower() not in {'cache','shadercache','crashpad','logs','log','temp','tmp','__pycache__','screenshots','captures','webcache','gpu_cache'}]
+                dirs[:]=[d for d in dirs if d.lower() not in {'cache','shadercache','crashpad','crash_reports','logs','log','temp','tmp','__pycache__','screenshots','captures','webcache','gpu_cache','profiles','profile','user data','node_modules','.git','packages'}]
                 if depth>max_depth: dirs[:]=[]
                 if depth and save_like(files,p.name):
                     c,b,l=summarize_path_fast(p)
@@ -563,79 +567,96 @@ def cmd_cache(args):
     if args.clear and cache.exists(): cache.unlink(); print('Discovery cache cleared')
     else: print(str(cache))
 
-def launch_gui():
-    import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
-    win=tk.Tk(); win.title(APP_NAME); win.geometry('1220x780'); win.configure(bg='#0b1020')
-    style=ttk.Style(win); style.theme_use('clam')
-    style.configure('.',background='#0b1020',foreground='#e5eefc',fieldbackground='#111827',font=('Segoe UI',10))
-    style.configure('Treeview',background='#111827',fieldbackground='#111827',foreground='#e5eefc',rowheight=34,borderwidth=0)
-    style.configure('Treeview.Heading',background='#172033',foreground='#e5eefc',font=('Segoe UI Semibold',10),padding=8)
-    style.map('Treeview',background=[('selected','#1e3a8a')]); style.configure('Accent.TButton',background='#38bdf8',foreground='#06111f',padding=(14,9),font=('Segoe UI Semibold',10)); style.configure('Ghost.TButton',background='#172033',foreground='#e5eefc',padding=(12,8))
-    games=[]; selected=set(); q=queue.Queue(); dest=tk.StringVar(value=wsl_to_win(str(backup_root()))); status=tk.StringVar(value='Ready. Discover Saves scans all visible drives/users/store manifests/save roots.'); progress=tk.DoubleVar(value=0); search=tk.StringVar()
-    header=tk.Frame(win,bg='#0b1020'); header.pack(fill='x',padx=24,pady=(20,10)); tk.Label(header,text='Save Guardian',bg='#0b1020',fg='#e5eefc',font=('Segoe UI Semibold',27)).pack(side='left'); tk.Label(header,text='professional all-PC game-save backup and restore',bg='#0b1020',fg='#94a3b8',font=('Segoe UI',11)).pack(side='left',padx=16,pady=(10,0))
-    main=tk.Frame(win,bg='#0b1020'); main.pack(fill='both',expand=True,padx=24,pady=10); side=tk.Frame(main,bg='#111827',width=280); side.pack(side='left',fill='y'); side.pack_propagate(False); content=tk.Frame(main,bg='#0b1020'); content.pack(side='left',fill='both',expand=True,padx=(18,0))
-    tk.Label(side,text='Backup destination',bg='#111827',fg='#94a3b8',font=('Segoe UI Semibold',9)).pack(anchor='w',padx=18,pady=(20,6)); ttk.Entry(side,textvariable=dest).pack(fill='x',padx=18); ttk.Button(side,text='Browse',style='Ghost.TButton',command=lambda: dest.set(filedialog.askdirectory() or dest.get())).pack(fill='x',padx=18,pady=8)
-    def run_bg(label,fn):
-        status.set(label); progress.set(10)
-        def work():
-            try: q.put(('ok',fn()))
-            except Exception as e: q.put(('err',e))
-        threading.Thread(target=work,daemon=True).start()
-    def populate():
-        term=search.get().lower().strip(); tree.delete(*tree.get_children())
-        for g in games:
-            if term and term not in g['title'].lower() and term not in g['platform'].lower(): continue
-            tree.insert('', 'end', iid=g['title'], values=('☑' if g['title'] in selected else '☐',g['title'],g['platform'],g['location_count'],g['size_human'],g.get('latest_write_iso') or '—',str(g['confidence'])+'%'))
-    def poll():
-        nonlocal games
-        try:
-            k,v=q.get_nowait(); progress.set(100)
-            if k=='err': status.set('Failed'); messagebox.showerror('Operation failed',str(v))
-            elif isinstance(v,list): games=v; status.set(f'Discovered {len(games)} games/save groups. Select games and back them up.'); populate(); update_stats()
-            else: status.set(str(v)); messagebox.showinfo('Done',str(v))
-        except queue.Empty:
-            if 0<progress.get()<94: progress.set(progress.get()+1.2)
-        win.after(180,poll)
-    def update_stats():
-        vals=[str(len(games)),str(sum(g['location_count'] for g in games)),human_size(sum(g['byte_count'] for g in games)),(max([g['latest_write'] for g in games] or [0]))]
-        vals[3]=(iso(vals[3]) or '—').replace('T',' ')
-        for lab,val in zip(cards,vals): cards[lab].config(text=val)
-    ttk.Button(side,text='Discover Saves',style='Accent.TButton',command=lambda: run_bg('Scanning all PC save locations...',lambda: discover_all_games(refresh=True))).pack(fill='x',padx=18,pady=(22,8))
-    ttk.Button(side,text='Backup Selected',style='Accent.TButton',command=lambda: run_bg('Backing up selected games...',lambda: '\n'.join(wsl_to_win(str(backup_record(g,dest.get()))) for g in games if g['title'] in selected) or 'Nothing selected')).pack(fill='x',padx=18,pady=8)
-    ttk.Button(side,text='Backup Browser',style='Ghost.TButton',command=lambda: messagebox.showinfo('Backups','\n'.join(f"{b['created_at']}  {b['game']}  {b['path_windows']}" for b in list_backups(dest.get())) or 'No backups found')).pack(fill='x',padx=18,pady=8)
-    ttk.Progressbar(side,variable=progress).pack(side='bottom',fill='x',padx=18,pady=8); tk.Label(side,textvariable=status,wraplength=230,justify='left',bg='#111827',fg='#94a3b8').pack(side='bottom',fill='x',padx=18,pady=18)
-    stats=tk.Frame(content,bg='#0b1020'); stats.pack(fill='x'); cards={}
-    for lab in ['Games','Locations','Total size','Latest']:
-        card=tk.Frame(stats,bg='#111827',padx=18,pady=13); card.pack(side='left',fill='x',expand=True,padx=(0,12)); tk.Label(card,text=lab.upper(),bg='#111827',fg='#94a3b8',font=('Segoe UI Semibold',8)).pack(anchor='w'); v=tk.Label(card,text='—',bg='#111827',fg='#e5eefc',font=('Segoe UI Semibold',18)); v.pack(anchor='w'); cards[lab]=v
-    tools=tk.Frame(content,bg='#0b1020'); tools.pack(fill='x',pady=12); ttk.Entry(tools,textvariable=search).pack(side='left',fill='x',expand=True); ttk.Button(tools,text='Filter',style='Ghost.TButton',command=populate).pack(side='left',padx=8); ttk.Button(tools,text='Select Visible',style='Ghost.TButton',command=lambda: (selected.update(tree.get_children()),populate())).pack(side='left')
-    pane=tk.PanedWindow(content,bg='#0b1020',sashwidth=8); pane.pack(fill='both',expand=True); left=tk.Frame(pane,bg='#111827'); right=tk.Frame(pane,bg='#111827'); pane.add(left,minsize=650); pane.add(right,minsize=330)
-    cols=('sel','game','platform','loc','size','latest','conf'); tree=ttk.Treeview(left,columns=cols,show='headings');
-    for col,txt,w in [('sel','✓',42),('game','Game',280),('platform','Platform',100),('loc','Locations',80),('size','Size',95),('latest','Latest save',150),('conf','Confidence',95)]: tree.heading(col,text=txt); tree.column(col,width=w)
-    tree.pack(fill='both',expand=True); detail=tk.Text(right,bg='#111827',fg='#e5eefc',relief='flat',wrap='word',font=('Consolas',10),padx=14,pady=14); detail.pack(fill='both',expand=True); detail.insert('end','Select a game to inspect every save path and why it was chosen.\n')
-    def click(e):
-        iid=tree.identify_row(e.y)
-        if not iid: return
-        if tree.identify_column(e.x)=='#1': selected.symmetric_difference_update({iid}); populate()
-        g=next((x for x in games if x['title']==iid),None); detail.delete('1.0','end')
-        if g:
-            detail.insert('end',f"{g['title']}\nPlatform: {g['platform']}\nConfidence: {g['confidence']}%\nFiles: {g['file_count']}  Size: {g['size_human']}\nInstall: {g.get('install_path') or 'unknown'}\n\n")
-            for i,s in enumerate(g['sources'],1): detail.insert('end',f"{i}. {s['path_windows']}\n   {s['file_count']} files, {s['size_human']}, confidence {s['confidence']}%\n   {s['reason']}\n   latest: {s.get('latest_write_iso') or 'unknown'}\n\n")
-    tree.bind('<ButtonRelease-1>',click); poll(); win.mainloop()
 
-WEB_CSS='body{margin:0;background:radial-gradient(circle at top left,#12355b,#08111f 40%,#070b14);color:#e5eefc;font-family:Inter,Segoe UI,system-ui}.wrap{max-width:1180px;margin:auto;padding:34px}.card{background:rgba(15,23,42,.86);border:1px solid rgba(148,163,184,.18);border-radius:24px;padding:22px;margin:16px 0;box-shadow:0 24px 70px rgba(0,0,0,.3)}h1{font-size:42px;letter-spacing:-.04em}.btn{background:linear-gradient(135deg,#38bdf8,#a78bfa);padding:12px 18px;border-radius:14px;color:#06111f;text-decoration:none;font-weight:800}table{width:100%;border-collapse:collapse}td,th{padding:13px;border-bottom:1px solid rgba(148,163,184,.14);text-align:left}th{color:#94a3b8;font-size:12px;text-transform:uppercase}.pill{border-radius:999px;background:#172554;color:#bfdbfe;padding:4px 9px;font-weight:700}'
+def api_discover(refresh: bool = False) -> dict:
+    games = discover_all_games(refresh=refresh)
+    return {'ok': True, 'generated_at': dt.datetime.now().isoformat(timespec='seconds'), 'default_backup_dir': wsl_to_win(str(backup_root())), 'count': len(games), 'games': games}
+
+def api_backups(root: str | None = None) -> dict:
+    backups = list_backups(root)
+    return {'ok': True, 'count': len(backups), 'backups': backups, 'default_backup_dir': wsl_to_win(str(backup_root()))}
+
+def api_backup_selected(payload: dict) -> dict:
+    destination = payload.get('destination') or wsl_to_win(str(backup_root()))
+    titles = payload.get('titles') or []
+    if not titles:
+        return {'ok': False, 'error': 'No games selected'}
+    discovered = {g.get('title'): g for g in discover_all_games(refresh=False)}
+    selected = [discovered[t] for t in titles if t in discovered]
+    if not selected:
+        return {'ok': False, 'error': 'No discovered games matched the requested selection'}
+    outputs = [backup_record(game, destination) for game in selected]
+    return {'ok': True, 'backups': [{'path': str(p), 'path_windows': wsl_to_win(str(p))} for p in outputs]}
+
+def render_app_shell() -> str:
+    default_dir = html.escape(wsl_to_win(str(backup_root())))
+    api_token = html.escape(API_TOKEN)
+    return f'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>{APP_NAME} - SaveVault Command Center</title>
+<style>
+:root{{--bg:#070a12;--panel:#0e1526;--panel2:#111b31;--glass:rgba(17,27,49,.72);--line:rgba(148,163,184,.18);--text:#e8f0ff;--muted:#94a3b8;--soft:#cbd5e1;--brand:#55d6ff;--brand2:#9b7cff;--good:#22c55e;--warn:#f59e0b;--danger:#fb7185;--shadow:0 30px 90px rgba(0,0,0,.45);}}
+*{{box-sizing:border-box}} body{{margin:0;min-height:100vh;color:var(--text);font-family:Inter,Segoe UI,system-ui,-apple-system,sans-serif;background:radial-gradient(circle at 15% -10%,rgba(85,214,255,.24),transparent 35%),radial-gradient(circle at 80% 0,rgba(155,124,255,.24),transparent 33%),linear-gradient(135deg,#070a12,#09111f 55%,#060814);overflow:hidden}} button,input{{font:inherit}} .app{{height:100vh;display:grid;grid-template-columns:300px 1fr;gap:22px;padding:22px}} .sidebar,.main-card,.drawer,.metric,.console{{background:var(--glass);border:1px solid var(--line);box-shadow:var(--shadow);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);border-radius:28px}} .sidebar{{padding:22px;display:flex;flex-direction:column;gap:18px}} .brand{{display:flex;gap:14px;align-items:center}} .logo{{width:52px;height:52px;border-radius:17px;background:linear-gradient(135deg,var(--brand),var(--brand2));display:grid;place-items:center;color:#02101c;font-size:28px;font-weight:900;box-shadow:0 16px 40px rgba(85,214,255,.28)}} h1{{font-size:21px;line-height:1.05;margin:0}} .sub{{color:var(--muted);font-size:13px;line-height:1.45}} .section-label{{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#7dd3fc;font-weight:800;margin-top:8px}} .field{{display:grid;gap:8px}} label{{font-size:12px;color:var(--muted);font-weight:700}} input{{width:100%;border:1px solid var(--line);background:rgba(8,13,24,.72);color:var(--text);border-radius:16px;padding:13px 14px;outline:none}} input:focus{{border-color:rgba(85,214,255,.8);box-shadow:0 0 0 4px rgba(85,214,255,.12)}} .btn{{border:0;border-radius:16px;padding:14px 16px;color:var(--text);font-weight:850;letter-spacing:.01em;cursor:pointer;transition:transform .16s ease,box-shadow .16s ease,filter .16s ease;background:#152036;border:1px solid var(--line)}} .btn:hover{{transform:translateY(-1px);filter:brightness(1.08)}} .btn.primary{{background:linear-gradient(135deg,var(--brand),var(--brand2));color:#04111f;box-shadow:0 18px 42px rgba(85,214,255,.24)}} .btn.good{{background:linear-gradient(135deg,#30e18a,#52d6ff);color:#04111f}} .btn-row{{display:grid;gap:10px}} .status{{margin-top:auto;padding:14px;border-radius:18px;background:rgba(2,6,23,.48);border:1px solid var(--line)}} .pulse{{display:inline-block;width:9px;height:9px;background:var(--good);border-radius:99px;margin-right:8px;box-shadow:0 0 0 7px rgba(34,197,94,.12)}} .main{{min-width:0;display:grid;grid-template-rows:auto auto 1fr;gap:18px}} .hero{{display:flex;justify-content:space-between;align-items:flex-start;gap:20px}} .eyebrow{{display:inline-flex;gap:8px;align-items:center;color:#bae6fd;background:rgba(14,165,233,.14);border:1px solid rgba(125,211,252,.25);border-radius:999px;padding:7px 11px;font-size:12px;font-weight:800}} .title{{font-size:48px;letter-spacing:-.055em;line-height:.95;margin:14px 0 10px}} .lead{{max-width:760px;color:var(--soft);font-size:16px;line-height:1.6}} .metrics{{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}} .metric{{padding:18px;border-radius:24px}} .metric span{{display:block;color:var(--muted);font-size:11px;font-weight:900;letter-spacing:.13em;text-transform:uppercase}} .metric strong{{display:block;font-size:27px;margin-top:8px;letter-spacing:-.03em}} .workspace{{min-height:0;display:grid;grid-template-columns:1fr 380px;gap:18px}} .main-card{{min-width:0;overflow:hidden;display:grid;grid-template-rows:auto 1fr}} .toolbar{{padding:16px;display:grid;grid-template-columns:1fr auto auto;gap:12px;border-bottom:1px solid var(--line)}} .table-wrap{{overflow:auto}} table{{width:100%;border-collapse:collapse}} th{{position:sticky;top:0;background:rgba(15,23,42,.96);color:#93c5fd;font-size:11px;text-transform:uppercase;letter-spacing:.12em;text-align:left;padding:14px;border-bottom:1px solid var(--line)}} td{{padding:15px 14px;border-bottom:1px solid rgba(148,163,184,.1);color:#dbeafe}} tr{{cursor:pointer;transition:background .12s ease}} tr:hover{{background:rgba(85,214,255,.07)}} tr.selected{{background:linear-gradient(90deg,rgba(85,214,255,.16),rgba(155,124,255,.08))}} .game-title{{font-weight:850;color:white}} .muted{{color:var(--muted)}} .pill{{display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:6px 10px;font-size:12px;font-weight:850;background:rgba(59,130,246,.14);color:#bfdbfe;border:1px solid rgba(147,197,253,.18)}} .confidence{{height:8px;border-radius:99px;background:#172033;overflow:hidden;min-width:88px}} .confidence i{{display:block;height:100%;background:linear-gradient(90deg,var(--brand),var(--good));border-radius:99px}} .drawer{{padding:18px;overflow:auto}} .drawer h2{{font-size:22px;margin:0 0 6px}} .source{{padding:14px;border-radius:18px;background:rgba(2,6,23,.42);border:1px solid var(--line);margin:12px 0}} .source code{{display:block;color:#dbeafe;white-space:pre-wrap;word-break:break-all;font-size:12px;margin-bottom:8px}} .console{{padding:14px;border-radius:18px;color:#a7f3d0;background:rgba(2,6,23,.58);font:12px/1.45 Consolas,monospace;min-height:92px;margin-top:12px;white-space:pre-wrap}} .toast{{position:fixed;right:24px;bottom:24px;max-width:420px;padding:16px 18px;border-radius:18px;background:rgba(15,23,42,.95);border:1px solid var(--line);box-shadow:var(--shadow);transform:translateY(120px);opacity:0;transition:.22s ease}} .toast.show{{transform:translateY(0);opacity:1}} .skeleton{{height:52px;margin:10px 14px;border-radius:16px;background:linear-gradient(90deg,rgba(148,163,184,.08),rgba(148,163,184,.18),rgba(148,163,184,.08));background-size:220% 100%;animation:shine 1.2s infinite}} @keyframes shine{{to{{background-position:-220% 0}}}} @media(max-width:1100px){{.app{{grid-template-columns:1fr;overflow:auto}}body{{overflow:auto}}.workspace{{grid-template-columns:1fr}}.metrics{{grid-template-columns:repeat(2,1fr)}}.title{{font-size:36px}}}}
+</style></head>
+<body><div id="app-shell" class="app"><aside class="sidebar"><div class="brand"><div class="logo">S</div><div><h1>SaveVault<br/>Command Center</h1><div class="sub">Universal Game Save Guardian</div></div></div><div class="section-label">Destination</div><div class="field"><label>Default backup folder</label><input id="destination" value="{default_dir}"/></div><div class="btn-row"><button class="btn primary" data-action="discover" id="discoverBtn">⚡ Discover Saves</button><button class="btn good" id="backupBtn">⬢ Backup Selected</button><button class="btn" id="refreshBackupsBtn">Restore Preview / Backups</button><button class="btn" id="clearBtn">Clear Selection</button></div><div class="section-label">Safety</div><div class="sub">Every source shows confidence, reason, latest write time and exact Windows path before backup. Restore stays preview-first.</div><div class="status"><div><span class="pulse"></span><b id="statusTitle">Ready</b></div><div class="sub" id="statusText">Press Discover Saves to scan all visible drives, users, stores and save roots.</div></div></aside><main class="main"><section class="hero"><div><div class="eyebrow">◈ Local-only premium dashboard</div><div class="title">Find every save worth protecting.</div><div class="lead">A fast PC-wide command center for discovering game saves, inspecting exact paths, choosing what matters, creating verifiable backups, and previewing restores without touching live data blindly.</div></div></section><section class="metrics"><div class="metric"><span>Games found</span><strong id="mGames">—</strong></div><div class="metric"><span>Save locations</span><strong id="mLocations">—</strong></div><div class="metric"><span>Total size</span><strong id="mSize">—</strong></div><div class="metric"><span>Latest save</span><strong id="mLatest">—</strong></div></section><section class="workspace"><div class="main-card"><div class="toolbar"><input id="search" placeholder="Search games, platforms, save paths..."/><button class="btn" id="selectAllBtn">Select visible</button><button class="btn" id="jsonBtn">Export JSON</button></div><div class="table-wrap"><table><thead><tr><th></th><th>Game</th><th>Platform</th><th>Locations</th><th>Size</th><th>Latest</th><th>Confidence</th></tr></thead><tbody id="gamesBody"><tr><td colspan="7"><div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div></td></tr></tbody></table></div></div><aside class="drawer"><h2 id="detailTitle">Restore Preview</h2><div class="sub" id="detailSub">Select a game to inspect every detected save path and then back up only what you choose.</div><div id="sources"></div><h2>Activity Timeline</h2><div class="console" id="console">Ready. No operation has run yet.</div></aside></section></main></div><div class="toast" id="toast"></div>
+<script>
+const API_TOKEN='{api_token}';
+let games=[]; let selectedGames=new Set(); let currentFilter=''; const $=id=>document.getElementById(id);
+function toast(msg){{const t=$('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),3200)}}
+function log(msg){{$('console').textContent=new Date().toLocaleTimeString()+'  '+msg+'\\n'+$('console').textContent.slice(0,1800)}}
+function status(title,text){{$('statusTitle').textContent=title;$('statusText').textContent=text;log(title+' - '+text)}}
+function fmtLatest(x){{return x?x.replace('T',' '):'—'}} function humanBytes(n){{let u=['B','KB','MB','GB','TB'],i=0,v=n||0;while(v>=1024&&i<u.length-1){{v/=1024;i++}}return i?`${{v.toFixed(1)}} ${{u[i]}}`:`${{v}} B`}}
+function escapeHtml(s){{return String(s??'').replace(/[&<>"']/g,m=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[m]))}} function escapeAttr(s){{return escapeHtml(s).replace(/`/g,'&#96;')}}
+function filtered(){{const q=currentFilter.toLowerCase();return games.filter(g=>!q||g.title.toLowerCase().includes(q)||g.platform.toLowerCase().includes(q)||JSON.stringify(g.sources||[]).toLowerCase().includes(q))}}
+function updateMetrics(){{$('mGames').textContent=games.length;$('mLocations').textContent=games.reduce((a,g)=>a+(g.location_count||0),0);$('mSize').textContent=humanBytes(games.reduce((a,g)=>a+(g.byte_count||0),0));let latest=games.map(g=>g.latest_write_iso).filter(Boolean).sort().pop();$('mLatest').textContent=fmtLatest(latest)}}
+function renderGames(){{const rows=filtered();$('gamesBody').innerHTML=rows.length?rows.map(g=>`<tr class="${{selectedGames.has(g.title)?'selected':''}}" data-title="${{escapeAttr(g.title)}}"><td>${{selectedGames.has(g.title)?'☑':'☐'}}</td><td><div class="game-title">${{escapeHtml(g.title)}}</div><div class="muted">${{escapeHtml((g.sources||[])[0]?.reason||'Discovered save group')}}</div></td><td><span class="pill">${{escapeHtml(g.platform||'Heuristic')}}</span></td><td>${{g.location_count||0}}</td><td>${{g.size_human||humanBytes(g.byte_count)}}</td><td>${{fmtLatest(g.latest_write_iso)}}</td><td><div class="confidence"><i style="width:${{g.confidence||0}}%"></i></div><div class="muted">${{g.confidence||0}}%</div></td></tr>`).join(''):`<tr><td colspan="7"><div class="source"><b>No matching games.</b><div class="sub">Try clearing the filter or run Discover Saves again.</div></div></td></tr>`;document.querySelectorAll('tbody tr[data-title]').forEach(r=>r.onclick=()=>selectGame(r.dataset.title));}}
+function selectGame(title){{const g=games.find(x=>x.title===title);if(!g)return;if(selectedGames.has(title))selectedGames.delete(title);else selectedGames.add(title);renderGames();renderDetail(g)}}
+function renderDetail(g){{$('detailTitle').textContent=g.title;$('detailSub').textContent=`${{g.platform}} • ${{g.location_count}} save locations • ${{g.size_human}} • confidence ${{g.confidence}}%`;$('sources').innerHTML=(g.sources||[]).map(s=>`<div class="source"><code>${{escapeHtml(s.path_windows||s.path)}}</code><div class="pill">${{s.confidence}}% confidence</div> <span class="pill">${{s.size_human}}</span><p class="sub">${{escapeHtml(s.reason||'Detected save location')}}</p><p class="muted">${{s.file_count}} files • latest ${{fmtLatest(s.latest_write_iso)}}</p></div>`).join('')||'<div class="source">No source details.</div>';}}
+async function discover(refresh=true){{status('Scanning','Indexing drives, Windows users, stores, manifests and save roots...');$('gamesBody').innerHTML='<tr><td colspan="7"><div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div></td></tr>';const res=await fetch('/api/discover?refresh='+(refresh?'1':'0'));const data=await res.json();games=data.games||[];selectedGames.clear();updateMetrics();renderGames();status('Discovery complete',`${{games.length}} game/save groups found. Select entries to back up.`);toast(`Found ${{games.length}} save groups`)}}
+async function loadBackups(){{const data=await (await fetch('/api/backups')).json();$('detailTitle').textContent='Restore Preview';$('detailSub').textContent=`${{data.count}} backups found in ${{escapeHtml(data.default_backup_dir)}}`;$('sources').innerHTML=(data.backups||[]).map(b=>`<div class="source"><b>${{escapeHtml(b.game||'Unknown')}}</b><code>${{escapeHtml(b.path_windows||b.path)}}</code><span class="pill">${{escapeHtml(b.size_human)}}</span><p class="muted">${{escapeHtml(b.created_at)}} • ${{escapeHtml(b.sources)}} sources</p></div>`).join('')||'<div class="source">No backups found yet.</div>';status('Backup browser','Loaded restore-preview backup list.')}}
+async function backupSelected(){{const selectedTitles=[...selectedGames];if(!selectedTitles.length){{toast('Select at least one game first');return}}status('Backing up',`Creating verifiable backups for ${{selectedTitles.length}} selected games...`);const res=await fetch('/api/backup',{{method:'POST',headers:{{'Content-Type':'application/json','X-UGSG-Token':API_TOKEN}},body:JSON.stringify({{destination:$('destination').value,titles:selectedTitles}})}});const data=await res.json();if(!data.ok){{toast(data.error||'Backup failed');status('Backup failed',data.error||'Unknown error');return}}toast('Backup complete');status('Backup complete',data.backups.map(b=>b.path_windows).join(' • '));await loadBackups()}}
+$('discoverBtn').onclick=()=>discover(true);$('backupBtn').onclick=backupSelected;$('refreshBackupsBtn').onclick=loadBackups;$('selectAllBtn').onclick=()=>{{filtered().forEach(g=>selectedGames.add(g.title));renderGames();toast('Visible games selected')}};$('clearBtn').onclick=()=>{{selectedGames.clear();renderGames();toast('Selection cleared')}};$('jsonBtn').onclick=()=>{{const blob=new Blob([JSON.stringify(games,null,2)],{{type:'application/json'}});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='save-guardian-discovery.json';a.click();}};$('search').oninput=e=>{{currentFilter=e.target.value;renderGames()}};loadBackups();discover(true);
+</script></body></html>'''
+
 class Web(BaseHTTPRequestHandler):
+    def _authorized(self) -> bool:
+        if self.headers.get('X-UGSG-Token') != API_TOKEN:
+            return False
+        origin = self.headers.get('Origin')
+        if origin and not (origin.startswith('http://127.0.0.1:') or origin.startswith('http://localhost:')):
+            return False
+        return True
+    def _json(self, obj: dict, status_code: int = 200) -> None:
+        data = json.dumps(obj, indent=2).encode('utf-8')
+        self.send_response(status_code); self.send_header('Content-Type', 'application/json; charset=utf-8'); self.send_header('Content-Length', str(len(data))); self.end_headers(); self.wfile.write(data)
+    def _html(self, body: str) -> None:
+        data = body.encode('utf-8')
+        self.send_response(200); self.send_header('Content-Type','text/html; charset=utf-8'); self.send_header('Content-Length', str(len(data))); self.end_headers(); self.wfile.write(data)
     def do_GET(self):
-        games=discover_all_games() if self.path.startswith('/discover') else []
-        body=f"<html><head><title>{APP_NAME}</title><style>{WEB_CSS}</style></head><body><div class=wrap><h1>{APP_NAME}</h1><p>Polished local web dashboard for all-PC game save discovery and backups.</p><a class=btn href='/discover'>Discover all saves</a>"
-        if games:
-            body+=f"<div class=card><b>{len(games)}</b> games/save groups • {human_size(sum(g['byte_count'] for g in games))}</div><div class=card><table><tr><th>Game</th><th>Platform</th><th>Locations</th><th>Size</th><th>Latest</th><th>Confidence</th></tr>"
-            for g in games[:300]: body+=f"<tr><td>{html.escape(g['title'])}</td><td><span class=pill>{html.escape(g['platform'])}</span></td><td>{g['location_count']}</td><td>{g['size_human']}</td><td>{g.get('latest_write_iso') or '—'}</td><td>{g['confidence']}%</td></tr>"
-            body+='</table></div>'
-        body+='</div></body></html>'
-        self.send_response(200); self.send_header('Content-Type','text/html; charset=utf-8'); self.end_headers(); self.wfile.write(body.encode())
-def serve(port:int):
-    http=ThreadingHTTPServer(('127.0.0.1', port), Web); print(f'Web UI http://127.0.0.1:{port}'); webbrowser.open(f'http://127.0.0.1:{port}'); http.serve_forever()
+        parsed = urllib.parse.urlparse(self.path)
+        try:
+            if parsed.path == '/api/discover':
+                qs = urllib.parse.parse_qs(parsed.query); self._json(api_discover(refresh=qs.get('refresh', ['0'])[0] == '1'))
+            elif parsed.path == '/api/backups': self._json(api_backups())
+            elif parsed.path in ('/', '/discover', '/app'): self._html(render_app_shell())
+            else: self._json({'ok': False, 'error': 'Not found'}, 404)
+        except Exception as exc: self._json({'ok': False, 'error': str(exc)}, 500)
+    def do_POST(self):
+        try:
+            if not self._authorized():
+                self._json({'ok': False, 'error': 'Unauthorized local request'}, 403); return
+            length = int(self.headers.get('Content-Length') or '0'); payload = json.loads(self.rfile.read(length).decode('utf-8') or '{}')
+            if self.path == '/api/backup': self._json(api_backup_selected(payload))
+            else: self._json({'ok': False, 'error': 'Not found'}, 404)
+        except Exception as exc: self._json({'ok': False, 'error': str(exc)}, 500)
+
+def serve(port:int, open_browser: bool = True):
+    http=ThreadingHTTPServer(('127.0.0.1', port), Web); url=f'http://127.0.0.1:{port}/app'; print(f'Premium local app {url}', flush=True)
+    if open_browser: webbrowser.open(url)
+    http.serve_forever()
+
+def launch_gui():
+    serve(8765, open_browser=True)
 
 def main(argv=None):
     p=argparse.ArgumentParser(description=APP_NAME); sub=p.add_subparsers(required=True)
