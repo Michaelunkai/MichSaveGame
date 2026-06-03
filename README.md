@@ -1,182 +1,121 @@
-# Universal Game Save Guardian
+# MichSaveGame
 
-Universal Game Save Guardian is a Windows-focused game-save discovery, backup, verification, and restore application inspired by GameSave Manager and Ludusavi.
+MichSaveGame is a premium local Windows game-save manager. It discovers save data across the PC, creates verifiable backups, previews/restores backups safely, and now includes a C-drive leftover cleaner for any game name you choose.
 
-It now provides a polished desktop GUI, a local web dashboard, and a CLI that can scan the whole PC for game save data across visible drives, Windows user profiles, store libraries, emulator/cracked-game save hints, and common save folders.
-
-## What it does
-
-- Finds save data for the currently running game or a named game.
-- Runs **Discover Saves** across the whole PC and lists every detected game/save group it can find.
-- Shows each save location with the reason it was detected, file count, size, latest modified time, and confidence score.
-- Lets you select one or more discovered games in the GUI and back them up.
-- Creates every backup in its own timestamped folder under the configured destination.
-- Stores `backup_manifest.json` beside copied payload files and also creates a `.tar.gz` archive.
-- Restores backups to original paths or to an alternate target root for another PC/user/machine.
-- Keeps a backup browser and verification command for confidence before restore.
-
-## Default backup location
-
-The default backup folder is:
+The app is designed for this default backup location:
 
 `F:\backup\gamesaves`
 
-Each backup is created in a separate folder such as:
+Each backup gets its own timestamped folder. Every cleanup delete is preview-first and copies files into a quarantine folder before removing the original leftovers.
 
-`F:\backup\gamesaves\Edge-of-Eternity-20260603-121732`
+## What it does
 
-## Prerequisites
+- Discovers game saves from Windows profiles, Documents/My Games, Saved Games, AppData, Public Documents, Steam userdata/compatdata, Steam/RUNE emulator hints, Epic manifests, and installed game folders.
+- Shows game title, confidence, exact Windows path, file count, size, latest write time, and discovery reason.
+- Backs up selected games with a manifest and archive.
+- Verifies backups and detects missing payload files.
+- Restores backups to original paths or an alternate root for another machine.
+- Finds C-drive leftovers for a specific game name under common cleanup roots.
+- Deletes leftovers safely by quarantining the folder into `F:\backup\gamesaves\_cleanup-quarantine` first.
+- Runs both as CLI and as a beautiful browser-first local dashboard.
 
-- Windows 10/11, or WSL with Windows drives mounted under `/mnt`.
-- Python 3.10+.
-- Optional for tests: `pytest`.
-
-The app is intentionally mostly Python-standard-library so it can run on machines without a heavy install.
-
-## Install / setup
+## Run the app
 
 From PowerShell:
 
 ```powershell
-cd "F:\study\Windows\Applications\Gaming\SaveData\Backup\Tools\Python\universal-game-save-guardian"
-python -m pip install -r requirements.txt
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "F:\study\Windows\Applications\Gaming\SaveData\Backup\Tools\Python\MichSaveGame\scripts\run-MichSaveGame.ps1" gui
 ```
 
-If PowerShell blocks scripts, use the one-liner below with `-ExecutionPolicy Bypass`.
+The local dashboard opens at:
 
-## Run the premium local app
+`http://127.0.0.1:8765/app`
+
+## CLI examples
+
+Discover one game:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "F:\study\Windows\Applications\Gaming\SaveData\Backup\Tools\Python\universal-game-save-guardian\scripts\run-game-save-guardian.ps1" gui
+.\scripts\run-MichSaveGame.ps1 discover --game "Edge of Eternity"
 ```
 
-`gui` now launches the premium browser-based local dashboard at `http://127.0.0.1:8765/app` and serves local-only APIs for discovery, backup selection, restore preview, and backup history. This replaced the old default-looking Tk form because the product-quality target is a polished modern command center.
-
-In the app:
-
-1. Confirm or change the backup destination.
-2. Press **Discover Saves**.
-3. Select one or more games in the beautiful list.
-4. Inspect the right-side detail panel to verify paths and reasons.
-5. Press **Backup Selected**.
-6. Use **Backup Browser** to see created backups.
-
-## CLI usage
-
-Discover the currently running game:
+Discover all visible save groups:
 
 ```powershell
-.\scripts\run-game-save-guardian.ps1 discover
+.\scripts\run-MichSaveGame.ps1 discover --all --refresh
 ```
 
-Discover a specific game:
+Back up a game:
 
 ```powershell
-.\scripts\run-game-save-guardian.ps1 discover --game "Edge of Eternity"
-```
-
-Discover all game saves across the PC and print JSON:
-
-```powershell
-.\scripts\run-game-save-guardian.ps1 discover --all --json
-```
-
-Create a backup for a specific game:
-
-```powershell
-.\scripts\run-game-save-guardian.ps1 backup --game "Edge of Eternity"
-```
-
-Create backups for all currently discovered save groups:
-
-```powershell
-.\scripts\run-game-save-guardian.ps1 backup --all
-```
-
-Change the default backup location:
-
-```powershell
-.\scripts\run-game-save-guardian.ps1 config --set-default "D:\MyGameSaveBackups"
+.\scripts\run-MichSaveGame.ps1 backup --game "Edge of Eternity"
 ```
 
 List backups:
 
 ```powershell
-.\scripts\run-game-save-guardian.ps1 list-backups
+.\scripts\run-MichSaveGame.ps1 list-backups
 ```
 
-Verify a backup folder:
+Preview restore:
 
 ```powershell
-.\scripts\run-game-save-guardian.ps1 verify "F:\backup\gamesaves\Edge-of-Eternity-YYYYMMDD-HHMMSS"
+.\scripts\run-MichSaveGame.ps1 restore "F:\backup\gamesaves\Edge-of-Eternity-YYYYMMDD-HHMMSS" --dry-run
 ```
 
-Preview restore actions without writing files:
+Restore to another machine/root preview folder:
 
 ```powershell
-.\scripts\run-game-save-guardian.ps1 restore "F:\backup\gamesaves\Edge-of-Eternity-YYYYMMDD-HHMMSS" --dry-run
+.\scripts\run-MichSaveGame.ps1 restore "F:\backup\gamesaves\Edge-of-Eternity-YYYYMMDD-HHMMSS" --target-root "D:\RestorePreview"
 ```
 
-Restore to an alternate root for testing or another machine layout:
+Preview C-drive leftovers for a game:
 
 ```powershell
-.\scripts\run-game-save-guardian.ps1 restore "F:\backup\gamesaves\Edge-of-Eternity-YYYYMMDD-HHMMSS" --target-root "D:\RestorePreview"
+.\scripts\run-MichSaveGame.ps1 cleanup --game "Edge of Eternity"
 ```
 
-Clear cached discovery results:
+Delete C-drive leftovers safely after preview:
 
 ```powershell
-.\scripts\run-game-save-guardian.ps1 scan-cache --clear
+.\scripts\run-MichSaveGame.ps1 cleanup --game "Edge of Eternity" --execute
 ```
 
-## Local web dashboard
+## Safety model
 
-```powershell
-.\scripts\run-game-save-guardian.ps1 web --port 8765
-```
-
-Then open:
-
-`http://127.0.0.1:8765`
-
-The web UI is local-only by default and mirrors the discovery dashboard.
-
-## Discovery strategy
-
-The app combines several methods instead of relying on one database:
-
-- Ludusavi manifest for known game save locations.
-- Running game process detection.
-- Steam library parsing from `libraryfolders.vdf` and `appmanifest_*.acf`.
-- Epic Games manifest parsing.
-- Standalone game folder hints from common drive-level game folders.
-- Steam emulator / RUNE / Goldberg-style save hints where available.
-- Fast save-root scans across Windows users and visible drives.
-- Save-like file classifiers and junk-folder exclusions to avoid caches, logs, shaders, screenshots, crash dumps, and temporary files.
-
-No tool can honestly guarantee perfect discovery of every possible game ever made, but this project is designed to go beyond manifest-only tools by combining known locations, live PC inspection, and heuristic fallback discovery.
+- Cleanup is preview-first unless `--execute` is used or the dashboard confirmation is accepted.
+- The app recomputes cleanup candidates on the server side. It does not trust browser-supplied file paths.
+- Local mutating API calls require a per-launch `X-UGSG-Token` and origin checks.
+- HTML/API-derived strings are escaped in the dashboard before rendering.
+- Deleted leftover folders are copied into quarantine before removal.
+- Restore can run as dry-run or into an alternate root before touching original paths.
 
 ## Important files
 
-- `game-save-guardian.py` — main runnable entry point.
-- `gamesave_guardian/app.py` — discovery, backup, restore, CLI, GUI, and web logic.
-- `scripts/run-game-save-guardian.ps1` — PowerShell 5-compatible runner.
-- `tests/test_guardian_core.py` — regression tests for path conversion, discovery, backup, restore, verification, and backup listing.
-- `data/ludusavi_manifest.yaml` — local cache downloaded on first use; ignored by Git because public manifest snapshots can trigger provider secret scanning false positives.
+- `michsavegame.py` — primary Python entry point.
+- `game-save-guardian.py` — compatibility entry point.
+- `gamesave_guardian/app.py` — discovery, backup, restore, cleanup, CLI, API, and web dashboard.
+- `scripts/run-MichSaveGame.ps1` — PowerShell launcher.
+- `scripts/run-game-save-guardian.ps1` — compatibility launcher.
+- `tests/` — regression tests for discovery, backup/restore/verify, API safety, dashboard shell, and C-drive cleanup.
+
+## Test locally
+
+```powershell
+python -m py_compile michsavegame.py game-save-guardian.py gamesave_guardian\app.py
+python -m pytest -q
+```
+
+On WSL-mounted drives, use a temporary pytest cache if needed:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -o cache_dir=/tmp/michsavegame-pytest-cache
+```
 
 ## Troubleshooting
 
-- If a game is not found, run the game once and then press **Discover Saves** again.
-- If a game uses a custom location, add or back up that folder manually through the selected game details in a future rule update.
-- If PowerShell says Python failed due to Windows Store aliases, use the included runner; it prefers `py.exe -3` and avoids broken WindowsApps aliases.
-- Always run `restore --dry-run` before restoring to original paths.
-- If a discovered item is not a game, simply do not select it for backup. The app shows confidence and reasons so false positives are visible.
-
-## Development verification
-
-```powershell
-python -m py_compile game-save-guardian.py gamesave_guardian\app.py
-python -m pytest -q
-.\scripts\run-game-save-guardian.ps1 discover --game "Edge of Eternity"
-.\scripts\run-game-save-guardian.ps1 discover --all --json
-```
+- If Python is missing, install Python 3 from python.org or run `winget install Python.Python.3.12`.
+- If the browser does not open automatically, visit `http://127.0.0.1:8765/app` manually after launching.
+- If a game is not found, use the cleanup/search box with the exact title or folder name and run a refreshed discovery.
+- If a cleanup candidate looks wrong, do not delete it. The exact path and reason are shown before any action.
+- Always run restore preview before restoring over live save folders.
