@@ -84,3 +84,35 @@ def test_list_backups_reads_metadata(tmp_path):
 
     assert backups[0]["game"] == "Game"
     assert backups[0]["path"].endswith("Game-20260101-010101")
+
+
+def test_all_save_roots_include_common_roots_on_every_visible_drive(monkeypatch, tmp_path):
+    drive_x = tmp_path / "x"
+    drive_y = tmp_path / "y"
+    for d in (drive_x, drive_y):
+        (d / "Users" / "Till" / "Saved Games").mkdir(parents=True)
+        (d / "ProgramData").mkdir()
+    monkeypatch.setattr(app, "visible_drives", lambda: [drive_x, drive_y])
+    monkeypatch.setattr(app, "steam_roots", lambda: [])
+
+    roots = {str(p) for p in app.all_save_roots()}
+
+    assert str(drive_x / "Users" / "Till" / "Saved Games") in roots
+    assert str(drive_y / "Users" / "Till" / "Saved Games") in roots
+    assert str(drive_x / "ProgramData") in roots
+    assert str(drive_y / "ProgramData") in roots
+
+
+def test_build_plan_uses_drivewide_fallback_when_manifest_and_known_roots_miss(monkeypatch, tmp_path):
+    save_dir = tmp_path / "weird_drive" / "Deep" / "Nested" / "Edge of Eternity" / "LatestSaves"
+    save_dir.mkdir(parents=True)
+    (save_dir / "latest.sav").write_bytes(b"latest")
+    monkeypatch.setattr(app, "detect_running_game", lambda: (None, None))
+    monkeypatch.setattr(app, "extract_manifest_sources", lambda game: (game, [], None))
+    monkeypatch.setattr(app, "heuristic_sources", lambda game, install_dir=None: [])
+    monkeypatch.setattr(app, "visible_drives", lambda: [tmp_path / "weird_drive"])
+
+    plan = app.build_plan("Edge of Eternity")
+
+    assert any(s.path == save_dir and s.exists and s.file_count == 1 for s in plan.sources)
+    assert any("all-visible-drive" in s.reason for s in plan.sources)

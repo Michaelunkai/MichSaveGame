@@ -222,25 +222,55 @@ def extra_crack_sources(install_dir: Optional[Path]) -> list[Path]:
             res.append(norm_path(raw))
     return res
 
-def heuristic_sources(game: str, install_dir: Optional[Path]=None) -> list[Path]:
-    terms=[t for t in re.split(r'[^A-Za-z0-9]+', game) if len(t)>2]
-    variants={game, game.replace(' ','') , game.replace(' ','_'), game.replace(' ','-')}
+def game_match_terms(game: str, install_dir: Optional[Path]=None) -> tuple[list[str], set[str]]:
+    terms=[t.lower() for t in re.split(r'[^A-Za-z0-9]+', game) if len(t)>2]
+    variants={game, game.replace(' ',''), game.replace(' ','_'), game.replace(' ','-'), safe_slug(game), re.sub(r'[^A-Za-z0-9]+','',game)}
     if install_dir: variants.add(install_dir.name)
-    roots=[Path.home()/ 'Documents'/'My Games', Path.home()/'Saved Games', Path.home()/'AppData/Local', Path.home()/'AppData/LocalLow', Path.home()/'AppData/Roaming', norm_path(r'C:\Users\Public\Documents\Steam')]
-    if os.name!='nt':
-        roots=[norm_path(str(r)) for r in roots]
-    found=[]
+    return terms, {v.lower() for v in variants if v}
+
+def matches_game_path(path: Path, game: str, install_dir: Optional[Path]=None) -> bool:
+    terms, variants = game_match_terms(game, install_dir)
+    low=str(path).lower()
+    compact=re.sub(r'[^a-z0-9]+','',low)
+    return any(v and (v in low or v in compact) for v in variants) or (terms and all(t in low for t in terms[:2]))
+
+def heuristic_sources(game: str, install_dir: Optional[Path]=None) -> list[Path]:
+    roots=all_save_roots()
+    found=[]; started=time.time(); budget=25.0
     for root in roots:
-        if not root.exists(): continue
+        if not root.exists() or time.time()-started>budget: continue
         try:
+            visited=0
             for dirpath, dirs, files in os.walk(root):
-                depth=len(Path(dirpath).relative_to(root).parts)
-                if depth>5: dirs[:] = []
-                low=dirpath.lower()
-                if any(v.lower() in low for v in variants) or all(t.lower() in low for t in terms[:2]):
-                    found.append(Path(dirpath)); dirs[:] = []
+                visited += 1
+                if visited > 12000 or time.time()-started>budget:
+                    dirs[:] = []; break
+                p=Path(dirpath)
+                try: depth=len(p.relative_to(root).parts)
+                except Exception: depth=0
+                if depth>8: dirs[:] = []
+                if matches_game_path(p, game, install_dir):
+                    found.append(p); dirs[:] = []
         except Exception: pass
     return found
+
+def drivewide_heuristic_sources(game: str, install_dir: Optional[Path]=None, max_depth: int = 14, budget_seconds: float = 120.0) -> list[Path]:
+    """Search every visible drive for game/save-shaped directories.
+
+    This is the fallback for games missing from manifests and known roots. It
+    walks each visible drive hierarchy (not just C: and not just Steam) and
+    records matching directories containing save-like files or save-like names.
+    """
+    found=[]; started=time.time()
+    for drive in visible_drives():
+        remaining=max(4.0, budget_seconds-(time.time()-started))
+        for p, files, depth in walk_dirs_all_hierarchy(drive, max_depth=max_depth, budget_seconds=remaining):
+            if time.time()-started > budget_seconds:
+                return list(dict.fromkeys(found))
+            low_name=p.name.lower()
+            if matches_game_path(p, game, install_dir) and (save_like(files, p.name) or 'save' in str(p).lower() or low_name in {'remote','profile','profiles'}):
+                found.append(p)
+    return list(dict.fromkeys(found))
 
 def build_plan(game: Optional[str]=None) -> GamePlan:
     proc, install_dir = detect_running_game()
@@ -256,6 +286,11 @@ def build_plan(game: Optional[str]=None) -> GamePlan:
         raw.extend((p, 'ludusavi manifest: '+pat, tags) for p in expand_manifest_path(pat,title,appid,install_dir))
     raw.extend((p, 'Steam/RUNE emulator save path from steam_emu.ini', ['save']) for p in extra_crack_sources(install_dir))
     raw.extend((p, 'heuristic save root match', ['save','heuristic']) for p in heuristic_sources(title, install_dir))
+    # Only run the expensive full hierarchy fallback when manifest/known-root
+    # discovery did not already find a usable existing source. The dashboard's
+    # all-games discovery still performs an all-drive fallback pass.
+    if not any(p.exists() and (p.is_file() or summarize_path_fast(p, max_files=1)[0] > 0) for p, _reason, _tags in raw):
+        raw.extend((p, 'all-visible-drive hierarchy fallback match', ['save','heuristic','all-drives']) for p in drivewide_heuristic_sources(title, install_dir, budget_seconds=45.0))
     dedup={}
     for p,reason,tags in raw:
         dedup[str(p.resolve() if p.exists() else p)] = (p,reason,tags)
@@ -342,16 +377,105 @@ def iso(ts:float)->str|None:
     return dt.datetime.fromtimestamp(ts).isoformat(timespec='seconds') if ts else None
 
 def visible_drives()->list[Path]:
-    if os.name=='nt':
-        return [Path(f'{c}:\\') for c in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' if Path(f'{c}:\\').exists()]
-    return [p for p in Path('/mnt').iterdir() if p.is_dir() and len(p.name)==1] if Path('/mnt').exists() else []
+    """Return every currently visible filesystem drive/root without a drive allowlist.
+
+    On Windows we ask PowerShell for FileSystem PSDrives so removable drives,
+    secondary SSDs, mapped letters, and non-standard letters are included. In
+    WSL we include every single-letter /mnt/<drive> mount that exists.
+    """
+    roots: list[Path] = []
+    if os.name == 'nt':
+        try:
+            import subprocess
+            out = subprocess.check_output(['powershell','-NoProfile','-Command',
+                "Get-PSDrive -PSProvider FileSystem | Select-Object -ExpandProperty Root"], text=True, timeout=8)
+            roots.extend(Path(line.strip()) for line in out.splitlines() if line.strip())
+        except Exception:
+            roots.extend(Path(f'{c}:\\') for c in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' if Path(f'{c}:\\').exists())
+    else:
+        mnt = Path('/mnt')
+        if mnt.exists():
+            roots.extend(p for p in mnt.iterdir() if p.is_dir() and len(p.name) == 1)
+        # Also ask Windows when available; some drives may not be mounted yet in WSL.
+        ps = Path('/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe')
+        if ps.exists():
+            try:
+                import subprocess
+                out = subprocess.check_output([str(ps),'-NoProfile','-Command',
+                    "Get-PSDrive -PSProvider FileSystem | Select-Object -ExpandProperty Root"], text=True, timeout=8)
+                for line in out.splitlines():
+                    raw = line.strip()
+                    if raw:
+                        roots.append(norm_path(raw))
+            except Exception:
+                pass
+    seen=set(); out=[]
+    for root in roots:
+        key=str(root).lower().rstrip('\\/')
+        if root.exists() and key not in seen:
+            seen.add(key); out.append(root)
+    return out
+
+def all_windows_user_roots()->list[Path]:
+    users: list[Path] = []
+    for drive in visible_drives():
+        root = drive / 'Users'
+        if root.exists():
+            try:
+                users.extend(p for p in root.iterdir() if p.is_dir() and p.name.lower() not in {'public','default','default user','all users'})
+            except Exception:
+                pass
+    env=os.environ.get('USERPROFILE')
+    if env:
+        users.append(norm_path(env))
+    seen=set(); out=[]
+    for u in users:
+        key=str(u).lower()
+        if u.exists() and key not in seen:
+            seen.add(key); out.append(u)
+    return out
+
+def walk_dirs_all_hierarchy(root: Path, max_depth: int = 12, max_dirs: int = 120000, budget_seconds: float = 90.0):
+    """Yield directories through a drive/root hierarchy with no game-drive allowlist.
+
+    The walker does not exclude whole drives or user-selected locations. It only
+    stops for permission errors, depth/cost limits, or filesystem failures so
+    the GUI cannot freeze forever on enormous system trees.
+    """
+    started = time.time(); visited = 0
+    try:
+        walker = os.walk(root, onerror=lambda _e: None)
+        for dirpath, dirs, files in walker:
+            visited += 1
+            p = Path(dirpath)
+            try:
+                depth = len(p.relative_to(root).parts)
+            except Exception:
+                depth = 0
+            if depth >= max_depth:
+                dirs[:] = []
+            if visited >= max_dirs or time.time() - started > budget_seconds:
+                dirs[:] = []
+                break
+            yield p, files, depth
+    except Exception:
+        return
+
+def windows_common_save_roots_for_drive(drive: Path) -> list[Path]:
+    roots=[drive/'ProgramData', drive/'Users'/'Public'/'Documents']
+    users=drive/'Users'
+    if users.exists():
+        try:
+            for u in users.iterdir():
+                if u.is_dir() and u.name.lower() not in {'public','default','default user','all users'}:
+                    roots += [u/'Documents', u/'Documents'/'My Games', u/'Saved Games', u/'AppData'/'Roaming', u/'AppData'/'Local', u/'AppData'/'LocalLow', u/'OneDrive'/'Documents', u/'OneDrive'/'Saved Games']
+        except Exception:
+            pass
+    roots += [drive/'Steam'/'userdata', drive/'SteamLibrary'/'steamapps'/'compatdata', drive/'SteamLibrary'/'userdata', drive/'Games', drive/'games', drive/'GOG Games', drive/'Epic Games']
+    return roots
 
 def windows_profiles()->list[Path]:
-    roots=[]; env=os.environ.get('USERPROFILE')
-    if env: roots.append(norm_path(env))
-    users=norm_path(r'C:\Users')
-    if users.exists():
-        roots += [p for p in users.iterdir() if p.is_dir() and p.name.lower() not in {'public','default','default user','all users'}]
+    roots = all_windows_user_roots()
     micha=norm_path(r'C:\Users\micha')
     if micha.exists(): roots.append(micha)
     seen=set(); out=[]
@@ -361,10 +485,12 @@ def windows_profiles()->list[Path]:
     return out
 
 def all_save_roots()->list[Path]:
+    """All high-probability save roots across every visible drive."""
     roots=[]
+    for drive in visible_drives():
+        roots += windows_common_save_roots_for_drive(drive)
     for u in windows_profiles():
         roots += [u/'Documents', u/'Documents'/'My Games', u/'Saved Games', u/'AppData'/'Roaming', u/'AppData'/'Local', u/'AppData'/'LocalLow', u/'OneDrive'/'Documents', u/'OneDrive'/'Saved Games']
-    roots += [norm_path(r'C:\Users\Public\Documents'), norm_path(r'C:\ProgramData')]
     for s in steam_roots(): roots += [s/'userdata', s/'steamapps'/'compatdata']
     seen=set(); out=[]
     for r in roots:
@@ -471,17 +597,29 @@ def discover_all_games(refresh=False, max_depth=5)->list[dict]:
             visited=0
             for dirpath, dirs, files in os.walk(root):
                 visited+=1
-                if visited>6000 or time.time()-started>root_budget:
+                if visited>12000 or time.time()-started>root_budget:
                     dirs[:]=[]; break
                 p=Path(dirpath); depth=len(p.relative_to(root).parts)
-                dirs[:]=[d for d in dirs if d.lower() not in {'cache','shadercache','crashpad','crash_reports','logs','log','temp','tmp','__pycache__','screenshots','captures','webcache','gpu_cache','profiles','profile','user data','node_modules','.git','packages'}]
                 if depth>max_depth: dirs[:]=[]
                 if depth and save_like(files,p.name):
                     c,b,l=summarize_path_fast(p)
                     if c>0:
-                        s=Source(p,f'All-PC fast save scan under {wsl_to_win(str(root))}',['heuristic','save-like'],True,c,b,l)
+                        s=Source(p,f'All-PC save-root scan under {wsl_to_win(str(root))}',['heuristic','save-like','all-drives'],True,c,b,l)
                         if source_score(s)>=45: add(infer_game_from_path(p,root),'Heuristic',s,None,False); dirs[:]=[]
         except Exception: pass
+    # Last-chance deep sweep: scan every visible drive hierarchy, so games that
+    # save outside AppData/Documents/Steam are still discoverable. This adds no
+    # drive allowlist; permission errors are simply skipped by the OS walker.
+    if time.time()-started < root_budget:
+        for drive in visible_drives():
+            if time.time()-started >= root_budget: break
+            for p, files, depth in walk_dirs_all_hierarchy(drive, max_depth=max_depth+4, max_dirs=50000, budget_seconds=max(2.0, root_budget-(time.time()-started))):
+                if depth and save_like(files, p.name):
+                    c,b,l=summarize_path_fast(p)
+                    if c>0:
+                        s=Source(p,f'Every visible drive hierarchy scan under {wsl_to_win(str(drive))}',['heuristic','save-like','all-drives','deep'],True,c,b,l)
+                        if source_score(s)>=45:
+                            add(infer_game_from_path(p, drive),'Heuristic',s,None,False)
     out=[]
     for rec in games.values():
         rec['sources'].sort(key=lambda s:(-s['confidence'],-s.get('latest_write',0),-s.get('byte_count',0)))

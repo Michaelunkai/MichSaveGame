@@ -19,5 +19,10 @@ if (-not $PythonCommand) {
 }
 
 if ($args.Count -eq 0) { $args = @('gui') }
-& $PythonCommand[0] @($PythonCommand[1..($PythonCommand.Count - 1)]) "$Root\michsavegame.py" @args
-exit $LASTEXITCODE
+$PythonExtraArgs = @()
+if ($PythonCommand.Count -gt 1) {
+    $PythonExtraArgs = @($PythonCommand[1..($PythonCommand.Count - 1)])
+}
+& $PythonCommand[0] @PythonExtraArgs "$Root\michsavegame.py" @args
+$Code = if ($null -eq $LASTEXITCODE) { 0 } else { $LASTEXITCODE }
+exit $Code

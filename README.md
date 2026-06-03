@@ -10,7 +10,7 @@ Each backup gets its own timestamped folder. Every cleanup delete is preview-fir
 
 ## What it does
 
-- Discovers game saves from Windows profiles, Documents/My Games, Saved Games, AppData, Public Documents, Steam userdata/compatdata, Steam/RUNE emulator hints, Epic manifests, and installed game folders.
+- Discovers game saves from every currently visible Windows filesystem drive, all Windows user profiles on those drives, Documents/My Games, Saved Games, AppData, Public Documents, ProgramData, Steam userdata/compatdata, Steam/RUNE emulator hints, Epic manifests, installed game folders, and a deep all-drive fallback for games that save outside known locations.
 - Shows game title, confidence, exact Windows path, file count, size, latest write time, and discovery reason.
 - Backs up selected games with a manifest and archive.
 - Verifies backups and detects missing payload files.
@@ -27,7 +27,7 @@ From PowerShell:
 & 'F:\study\Windows\Applications\Gaming\SaveData\Backup\Tools\Python\MichSaveGame\run-MichSaveGame.ps1'
 ```
 
-The runner now defaults to `gui`, so no argument is required. If port `8765` is blocked or already used by Windows, MichSaveGame automatically picks the next safe local port and opens that URL.
+The runner now defaults to `gui`, so no argument is required. If port `8765` is blocked or already used by Windows, MichSaveGame automatically picks the next safe local port and opens that URL. Discovery has a fast known-save-root pass plus a deep every-visible-drive fallback so non-standard save folders on C:, D:, E:, F:, USB, removable, or other mounted drives are still included.
 
 The local dashboard opens at:
 
@@ -118,6 +118,6 @@ PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -o cache_dir=/tmp/michsavegame-pyt
 
 - If Python is missing, install Python 3 from python.org or run `winget install Python.Python.3.12`.
 - If the browser does not open automatically, visit `http://127.0.0.1:8765/app` manually after launching.
-- If a game is not found, use the cleanup/search box with the exact title or folder name and run a refreshed discovery.
+- If a game is not found, use the search box with the exact title/folder name and run a refreshed discovery. MichSaveGame scans every visible filesystem drive it can access; folders blocked by Windows permissions or offline/unmounted drives cannot be read until Windows exposes them.
 - If a cleanup candidate looks wrong, do not delete it. The exact path and reason are shown before any action.
 - Always run restore preview before restoring over live save folders.
