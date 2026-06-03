@@ -91,9 +91,34 @@ def test_shell_is_rebranded_for_michsavegame_and_has_cleanup_workflow():
     html = app.render_app_shell()
 
     assert "MichSaveGame" in html
-    assert "Delete C-drive leftovers" in html
+    assert "Delete typed-game leftovers" in html
+    assert "Delete checked games saves + leftovers" in html
     assert "fetch('/api/leftovers?" in html
     assert "fetch('/api/delete-leftovers'" in html
+    assert "fetch('/api/delete-selected'" in html
     assert "authHeaders" in html
     assert "jsonHeaders" in html
     assert "Beautiful, safe cleanup" in html
+
+
+
+def test_api_delete_selected_quarantines_saves_and_removes_from_source(monkeypatch, tmp_path):
+    source = tmp_path / "Users" / "Till" / "Saved Games" / "Fixture Quest" / "Saves"
+    source.mkdir(parents=True)
+    (source / "slot.sav").write_bytes(b"save")
+    backup_root = tmp_path / "backups"
+    monkeypatch.setattr(app, "backup_root", lambda: backup_root)
+    monkeypatch.setattr(app, "should_skip_discovery_dir", lambda path: False)
+    monkeypatch.setattr(app, "discover_all_games", lambda refresh=False: [{
+        "title": "Fixture Quest",
+        "sources": [app.source_json(app.Source(source, "fixture", ["save"], True, *app.summarize_path(source)))],
+    }])
+    monkeypatch.setattr(app, "cleanup_game_leftovers", lambda game, execute=True: {"ok": True, "game": game, "count": 0, "actions": []})
+
+    result = app.api_delete_selected({"titles": ["Fixture Quest"]})
+
+    assert result["ok"] is True
+    assert result["deleted_games"] == ["Fixture Quest"]
+    assert not source.exists()
+    assert list(backup_root.rglob("slot.sav"))
+    assert list(backup_root.rglob("delete_selected_manifest.json"))

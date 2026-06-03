@@ -76,3 +76,31 @@ def test_shell_embeds_csrf_token_and_escapes_reason():
     assert "X-UGSG-Token" in html
     assert "selectedTitles" in html
     assert "escapeHtml((g.sources||[])[0]?.reason" in html
+
+
+def test_shell_has_non_cutoff_full_game_list_ui():
+    html = app.render_app_shell()
+
+    assert "overflow:auto" in html
+    assert "id=\"listMeta\"" in html
+    assert "Showing ${rows.length} of ${games.length} save groups" in html
+    assert "rows.slice" not in html
+    assert "games.slice" not in html
+
+
+
+
+def test_web_json_suppresses_client_abort_without_traceback():
+    handler = app.Web.__new__(app.Web)
+    calls = []
+    handler.send_response = lambda code: calls.append(("status", code))
+    handler.send_header = lambda key, value: calls.append(("header", key, value))
+    handler.end_headers = lambda: calls.append(("end",))
+    class AbortingWriter:
+        def write(self, data):
+            raise ConnectionAbortedError("client closed")
+    handler.wfile = AbortingWriter()
+
+    handler._json({"ok": True})
+
+    assert calls and calls[0] == ("status", 200)

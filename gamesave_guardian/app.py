@@ -272,6 +272,19 @@ def drivewide_heuristic_sources(game: str, install_dir: Optional[Path]=None, max
                 found.append(p)
     return list(dict.fromkeys(found))
 
+
+def matching_installed_hints(game: str) -> list[dict]:
+    terms, variants = game_match_terms(game)
+    matches=[]
+    for hint in installed_game_hints():
+        title = str(hint.get('title') or '')
+        install = str(hint.get('install_path') or '')
+        hay = (title + ' ' + install).lower()
+        compact = re.sub(r'[^a-z0-9]+','', hay)
+        if any(v and (v in hay or v in compact) for v in variants) or (terms and all(t in hay for t in terms[:2])):
+            matches.append(hint)
+    return matches
+
 def build_plan(game: Optional[str]=None) -> GamePlan:
     proc, install_dir = detect_running_game()
     target = game or proc or ''
@@ -284,7 +297,19 @@ def build_plan(game: Optional[str]=None) -> GamePlan:
     raw=[]
     for pat,tags in manifest_paths:
         raw.extend((p, 'ludusavi manifest: '+pat, tags) for p in expand_manifest_path(pat,title,appid,install_dir))
-    raw.extend((p, 'Steam/RUNE emulator save path from steam_emu.ini', ['save']) for p in extra_crack_sources(install_dir))
+    candidate_install_dirs=[]
+    if install_dir:
+        candidate_install_dirs.append(install_dir)
+    for hint in matching_installed_hints(title):
+        if hint.get('install_path'):
+            candidate_install_dirs.append(norm_path(hint['install_path']))
+    seen_installs=set()
+    for idir in candidate_install_dirs:
+        key=str(idir).lower()
+        if key in seen_installs:
+            continue
+        seen_installs.add(key)
+        raw.extend((p, 'Steam/RUNE emulator save path from steam_emu.ini', ['save']) for p in extra_crack_sources(idir))
     raw.extend((p, 'heuristic save root match', ['save','heuristic']) for p in heuristic_sources(title, install_dir))
     # Only run the expensive full hierarchy fallback when manifest/known-root
     # discovery did not already find a usable existing source. The dashboard's
@@ -337,6 +362,46 @@ def backup(game: Optional[str], destination: Optional[str], include_missing=Fals
     with tarfile.open(out.with_suffix('.tar.gz'), 'w:gz') as tar: tar.add(out, arcname=out.name)
     return out
 
+def backup_payload_path(backup_dir: Path, payload_rel: str) -> Path:
+    return backup_dir / str(payload_rel).replace('\\', '/')
+
+CLIENT_ABORT_EXCEPTIONS = (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)
+
+def path_is_under(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except Exception:
+        low=str(path).replace('\\','/').lower().rstrip('/')
+        root_low=str(root).replace('\\','/').lower().rstrip('/')
+        return low == root_low or low.startswith(root_low + '/')
+
+def title_is_generic_non_game(title: str) -> bool:
+    slug=safe_slug(title).lower()
+    generic={
+        'save','saves','saved-games','savegames','savegame','savedata','save-data','data','userdata','remote',
+        'profile','profiles','config','settings','cache','shadercache','logs','log','temp','tmp','desktop',
+        'documents','downloads','programdata','appdata','local','roaming','locallow','common','content',
+        'assets','resources','res','sprites','animations','menus','battle','player','user','public','micha','till'
+    }
+    return slug in generic or bool(re.fullmatch(r'\d+|[0-9a-f]{8,}', slug))
+
+def looks_like_game_source(source: Source, platform: str, manifest_hit: bool, install_path: Optional[str], hints: Optional[list[dict]] = None) -> bool:
+    if title_is_generic_non_game(source.path.name):
+        # Generic leaf names like Saves/Remote are fine if the inferred title came
+        # from a parent/hint, so do not decide only from the leaf.
+        pass
+    reason=source.reason.lower()
+    if manifest_hit or platform in {'Steam','Epic','GOG','Standalone'} or install_path or 'manifest' in reason or 'emulator' in reason or 'store' in reason:
+        return True
+    if hints and infer_game_from_installed_path(source.path, hints):
+        return True
+    low=str(source.path).replace('\\','/').lower()
+    game_markers=['/games/','/gog games/','/epic games/','/steamapps/common/','/steam/userdata/','/steamapps/compatdata/','/saved games/','/my games/']
+    if any(marker in low for marker in game_markers):
+        return True
+    return source_score(source) >= 60 and not should_skip_discovery_dir(source.path)
+
 def restore_target_for(original: str, target_root: Optional[str]) -> Path:
     if not target_root:
         return norm_path(original)
@@ -356,7 +421,7 @@ def restore(backup_dir: str, target_root: Optional[str]=None, dry_run=False) -> 
     actions=[]
     safety_root=b/('restore-safety-backup-'+dt.datetime.now().strftime('%Y%m%d-%H%M%S'))
     for src in meta.get('sources',[]):
-        payload=b/src['payload']
+        payload=backup_payload_path(b, src['payload'])
         dest=restore_target_for(src['restore_to'], target_root)
         actions.append(f"{payload} -> {dest}")
         if dry_run: continue
@@ -435,6 +500,29 @@ def all_windows_user_roots()->list[Path]:
             seen.add(key); out.append(u)
     return out
 
+def should_skip_discovery_dir(path: Path) -> bool:
+    """Skip non-game infrastructure/output trees that create fake save groups.
+
+    This does not exclude drive letters or user game locations; it prevents the
+    app from listing its own repository, its backup archives, OS internals, and
+    dependency/build caches as if they were games.
+    """
+    low = str(path).replace('\\','/').lower()
+    protected_prefixes = []
+    for candidate in (ROOT, backup_root(), backup_root().parent, CONFIG_DIR, norm_path(r'F:\study'), norm_path(r'F:\backup'), norm_path(r'C:\Windows')):
+        try:
+            protected_prefixes.append(str(candidate).replace('\\','/').lower().rstrip('/'))
+        except Exception:
+            pass
+    if any(prefix and (low == prefix or low.startswith(prefix + '/')) for prefix in protected_prefixes):
+        return True
+    parts = {part.lower() for part in path.parts}
+    noisy = {'.git','__pycache__','node_modules','.venv','venv','env','site-packages','dist','build','target','coverage','.cache','windows','system32','syswow64','winsxs','installer','program files','program files (x86)','trainer-reports','user data','chrome','google','extensions','desktop','downloads','streamingassets','soundtrack','ost','music','audio','movies','videos','video','wallpapers','artbook','manual'}
+    if parts.intersection(noisy):
+        return True
+    low_name = path.name.lower()
+    return 'soundtrack' in low_name or low_name.endswith(' ost') or low_name.endswith('-ost')
+
 def walk_dirs_all_hierarchy(root: Path, max_depth: int = 12, max_dirs: int = 120000, budget_seconds: float = 90.0):
     """Yield directories through a drive/root hierarchy with no game-drive allowlist.
 
@@ -452,11 +540,15 @@ def walk_dirs_all_hierarchy(root: Path, max_depth: int = 12, max_dirs: int = 120
                 depth = len(p.relative_to(root).parts)
             except Exception:
                 depth = 0
+            dirs[:] = [d for d in dirs if not should_skip_discovery_dir(p / d)]
             if depth >= max_depth:
                 dirs[:] = []
             if visited >= max_dirs or time.time() - started > budget_seconds:
                 dirs[:] = []
                 break
+            if should_skip_discovery_dir(p):
+                dirs[:] = []
+                continue
             yield p, files, depth
     except Exception:
         return
@@ -545,13 +637,52 @@ def installed_game_hints()->list[dict]:
         if key not in seen: seen.add(key); out.append(g)
     return out
 
+def humanize_game_title(title: str) -> str:
+    raw = str(title or '').strip().strip('._-') or 'Unknown Game'
+    raw = re.sub(r'_Data$', '', raw, flags=re.I)
+    raw = raw.replace('_', ' ').replace('-', ' ')
+    raw = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', raw)
+    raw = re.sub(r'\s+', ' ', raw).strip()
+    if not raw:
+        return 'Unknown Game'
+    # Preserve existing mixed/camel casing enough to avoid shouting; title-case
+    # only all-lower/all-upper folder slugs.
+    if raw.islower() or raw.isupper():
+        return raw.title()
+    return raw
+
 def infer_game_from_path(p:Path, root:Path)->str:
     try: parts=list(p.relative_to(root).parts)
     except Exception: parts=list(p.parts)
-    bad={'save','saves','saved games','savegames','profiles','remote','userdata','data'}
+    if parts and root.name.lower() in {'games','gog games','epic games','steamapps','common'}:
+        return humanize_game_title(parts[0])
+    for part in parts:
+        if part.lower().endswith('_data') and len(part) > 5:
+            return humanize_game_title(part)
+    bad={'save','saves','saved games','savegames','profiles','profile','remote','userdata','data','res','resources','js','animations','sprites','spr','menus','inmot','battle'}
     for part in reversed(parts[:-1] or parts):
-        if part.lower() not in bad and not re.fullmatch(r'\d+',part): return part
-    return p.name or 'Unknown Game'
+        low=part.lower()
+        if low not in bad and not re.fullmatch(r'\d+',part): return humanize_game_title(part)
+    return humanize_game_title(p.name or 'Unknown Game')
+
+def infer_game_from_installed_path(p: Path, hints: list[dict]) -> Optional[str]:
+    candidates=[]
+    try:
+        resolved = p.resolve() if p.exists() else p
+    except Exception:
+        resolved = p
+    low = str(resolved).lower()
+    for hint in hints:
+        raw = hint.get('install_path')
+        if not raw:
+            continue
+        ip = norm_path(str(raw))
+        ilow = str(ip).lower().rstrip('\\/')
+        if ilow and (low == ilow or low.startswith(ilow + os.sep) or low.startswith(ilow + '/')):
+            candidates.append((len(ilow), hint.get('title') or ip.name))
+    if not candidates:
+        return None
+    return humanize_game_title(sorted(candidates, reverse=True)[0][1])
 
 def summarize_path_fast(p:Path, max_files:int=600)->tuple[int,int,float]:
     count=size=0; latest=0.0
@@ -565,9 +696,12 @@ def summarize_path_fast(p:Path, max_files:int=600)->tuple[int,int,float]:
     except Exception: pass
     return count,size,latest
 
-def discover_all_games(refresh=False, max_depth=5)->list[dict]:
+def discover_all_games(refresh=False, max_depth=8)->list[dict]:
     cache=CONFIG_DIR/'discovery-cache-v2.json'
-    started=time.time(); root_budget=25.0
+    # Discovery is allowed to be thorough: the UI shows progress while scanning,
+    # and the result must include every readable save group we can find instead
+    # of silently cutting off after a tiny fast-scan budget.
+    started=time.time(); root_budget=120.0
     if not refresh and cache.exists():
         try:
             obj=json.loads(cache.read_text(encoding='utf-8'))
@@ -575,9 +709,17 @@ def discover_all_games(refresh=False, max_depth=5)->list[dict]:
         except Exception: pass
     games={}
     def add(title, platform, source:Source, install_path=None, manifest_hit=False):
-        blacklist={'docker','powershell','windowspowershell','windows','mozilla','internet-explorer','claude','netlify','everything','flingtrainer','microsoft','google','chrome','edge','nodejs','python','npm','hermes','user-data','user','user-pinned','content','lib','output','man','start-menu','inetcache','oneauth','saved','config','dist','title','player','ludusavi','token-optimizer','savedgames','goldberg-steamemu-saves','gse-saves','steamemu','rune','codex','nvidia-corporation','wlanservice','wlansvc','updateframework','firefox','snapshots','chocolatey','chocolateyinstall','cosmos','cef','deno','migrationdata','open-interpreter','jszip','startup64','agents','artificial-intelligence','artificial_intelligence','test'}
+        title = humanize_game_title(title)
+        # Filter obvious non-game system/app folders only by exact slug/path
+        # components. Never substring-drop titles: real games contain words like
+        # "Edge", "Chrome", "Python", or "Microsoft" and must still appear.
+        exact_blacklist={'docker','powershell','windowspowershell','windows','mozilla','internet-explorer','claude','netlify','everything','flingtrainer','google','nodejs','npm','hermes','user-data','user','user-pinned','content','lib','output','man','start-menu','inetcache','oneauth','saved','config','dist','title','player','ludusavi','token-optimizer','savedgames','goldberg-steamemu-saves','gse-saves','steamemu','rune','codex','nvidia-corporation','wlanservice','wlansvc','updateframework','firefox','snapshots','chocolatey','chocolateyinstall','cosmos','cef','deno','migrationdata','open-interpreter','jszip','startup64','agents','artificial-intelligence','artificial_intelligence','test'}
         slug=safe_slug(title).lower()
-        if slug in blacklist or re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', slug) or any(x in slug for x in ['docker','powershell','mozilla','internet-explorer','chrome','microsoft','python','cache','start-menu','user-data']):
+        source_bits={part.lower() for part in source.path.parts}
+        component_blacklist={'windows','system32','syswow64','node_modules','.git','__pycache__','cache','gpu_cache','webcache','start menu'}
+        if slug in exact_blacklist or title_is_generic_non_game(title) or re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', slug) or source_bits.intersection(component_blacklist):
+            return
+        if not looks_like_game_source(source, platform, manifest_hit, install_path, hints):
             return
         key=slug
         rec=games.setdefault(key, {'title':title,'platform':platform,'install_path':install_path,'manifest_hit':manifest_hit,'sources':[]})
@@ -587,7 +729,8 @@ def discover_all_games(refresh=False, max_depth=5)->list[dict]:
         if str(source.path).lower() not in {s['path'].lower() for s in rec['sources']}: rec['sources'].append(source_json(source))
     # Store libraries give game names/install roots quickly. Avoid per-game manifest parsing here;
     # the broad save-root pass below is much faster and finds real existing saves.
-    for hint in installed_game_hints():
+    hints = installed_game_hints()
+    for hint in hints:
         for sp in extra_crack_sources(norm_path(hint['install_path']) if hint.get('install_path') else None):
             c,b,l=summarize_path_fast(sp)
             s=Source(sp,'Store/emulator config declared save location',['save','store'],sp.exists(),c,b,l)
@@ -600,12 +743,16 @@ def discover_all_games(refresh=False, max_depth=5)->list[dict]:
                 if visited>12000 or time.time()-started>root_budget:
                     dirs[:]=[]; break
                 p=Path(dirpath); depth=len(p.relative_to(root).parts)
+                dirs[:] = [d for d in dirs if not should_skip_discovery_dir(p / d)]
+                if should_skip_discovery_dir(p):
+                    dirs[:] = []; continue
                 if depth>max_depth: dirs[:]=[]
                 if depth and save_like(files,p.name):
                     c,b,l=summarize_path_fast(p)
                     if c>0:
                         s=Source(p,f'All-PC save-root scan under {wsl_to_win(str(root))}',['heuristic','save-like','all-drives'],True,c,b,l)
-                        if source_score(s)>=45: add(infer_game_from_path(p,root),'Heuristic',s,None,False); dirs[:]=[]
+                        if source_score(s)>=45:
+                            add(infer_game_from_installed_path(p, hints) or infer_game_from_path(p,root),'Heuristic',s,None,False); dirs[:]=[]
         except Exception: pass
     # Last-chance deep sweep: scan every visible drive hierarchy, so games that
     # save outside AppData/Documents/Steam are still discoverable. This adds no
@@ -619,7 +766,7 @@ def discover_all_games(refresh=False, max_depth=5)->list[dict]:
                     if c>0:
                         s=Source(p,f'Every visible drive hierarchy scan under {wsl_to_win(str(drive))}',['heuristic','save-like','all-drives','deep'],True,c,b,l)
                         if source_score(s)>=45:
-                            add(infer_game_from_path(p, drive),'Heuristic',s,None,False)
+                            add(infer_game_from_installed_path(p, hints) or infer_game_from_path(p, drive),'Heuristic',s,None,False)
     out=[]
     for rec in games.values():
         rec['sources'].sort(key=lambda s:(-s['confidence'],-s.get('latest_write',0),-s.get('byte_count',0)))
@@ -671,7 +818,7 @@ def verify_backup(backup_dir)->dict:
     b=norm_path(backup_dir); meta=json.loads((b/'backup_manifest.json').read_text(encoding='utf-8'))
     missing=[]; mismatched=[]; checked=0
     for src in meta.get('sources',[]):
-        payload=b/src['payload']
+        payload=backup_payload_path(b, src['payload'])
         expected=src.get('file_count',0)
         if not payload.exists():
             missing.append(str(payload)); continue
@@ -863,6 +1010,45 @@ def api_backup_selected(payload: dict) -> dict:
     outputs = [backup_record(game, destination) for game in selected]
     return {'ok': True, 'backups': [{'path': str(p), 'path_windows': wsl_to_win(str(p))} for p in outputs]}
 
+def quarantine_and_remove(path: Path, quarantine_root: Path, actions: list[dict], label: str) -> None:
+    if not path.exists():
+        return
+    qdst = quarantine_root / hashlib.sha256(str(path).lower().encode('utf-8')).hexdigest()[:16] / safe_slug(path.name or 'root')
+    count, size, latest = summarize_path_fast(path, max_files=5000)
+    actions.append({'label': label, 'path': str(path), 'path_windows': wsl_to_win(str(path)), 'files': count, 'size': size, 'size_human': human_size(size), 'quarantine_to': str(qdst), 'quarantine_to_windows': wsl_to_win(str(qdst))})
+    copy_tree(path, qdst)
+    remove_path(path)
+
+def delete_game_save_and_leftovers(record: dict) -> dict:
+    title = record.get('title') or 'Unknown Game'
+    ts = dt.datetime.now().strftime('%Y%m%d-%H%M%S')
+    quarantine = backup_root() / '_delete-selected-quarantine' / f"{safe_slug(title)}-{ts}"
+    quarantine.mkdir(parents=True, exist_ok=True)
+    actions=[]
+    for src in record.get('sources', []):
+        path=norm_path(src.get('path') or '')
+        if path.exists() and not should_skip_discovery_dir(path):
+            quarantine_and_remove(path, quarantine, actions, 'save-data')
+    leftovers = cleanup_game_leftovers(title, execute=True)
+    manifest={'app': APP_NAME, 'version': '4.0.0', 'mode': 'delete-selected-game', 'game': title, 'created_at': dt.datetime.now().isoformat(timespec='seconds'), 'save_actions': actions, 'leftover_cleanup': leftovers}
+    (quarantine/'delete_selected_manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
+    return {'game': title, 'save_actions': actions, 'leftover_cleanup': leftovers, 'quarantine_path': str(quarantine), 'quarantine_path_windows': wsl_to_win(str(quarantine))}
+
+def api_delete_selected(payload: dict) -> dict:
+    titles = payload.get('titles') or []
+    if not titles:
+        return {'ok': False, 'error': 'No games selected'}
+    discovered = {g.get('title'): g for g in discover_all_games(refresh=False)}
+    selected = [discovered[t] for t in titles if t in discovered]
+    if not selected:
+        return {'ok': False, 'error': 'No discovered games matched the requested selection'}
+    results=[delete_game_save_and_leftovers(rec) for rec in selected]
+    cache=CONFIG_DIR/'discovery-cache-v2.json'
+    if cache.exists():
+        try: cache.unlink()
+        except Exception: pass
+    return {'ok': True, 'deleted_games': [r['game'] for r in results], 'results': results}
+
 
 def api_leftovers(game: str) -> dict:
     return discover_game_leftovers(game)
@@ -881,8 +1067,8 @@ def render_app_shell() -> str:
 <title>{APP_NAME} — Beautiful, safe cleanup + saves</title>
 <style>
 :root{{--bg:#050712;--bg2:#08111f;--card:rgba(13,22,39,.78);--card2:rgba(20,31,55,.86);--line:rgba(148,163,184,.18);--text:#eef6ff;--muted:#9fb0ca;--brand:#67e8f9;--brand2:#a78bfa;--hot:#fb7185;--good:#34d399;--warn:#fbbf24;--shadow:0 30px 100px rgba(0,0,0,.52)}}
-*{{box-sizing:border-box}} body{{margin:0;min-height:100vh;overflow:hidden;color:var(--text);font-family:Inter,Segoe UI,system-ui,sans-serif;background:radial-gradient(circle at 8% 0,rgba(103,232,249,.28),transparent 34%),radial-gradient(circle at 82% 4%,rgba(167,139,250,.24),transparent 32%),linear-gradient(135deg,var(--bg),var(--bg2));}}button,input{{font:inherit}} .app{{height:100vh;display:grid;grid-template-columns:324px 1fr;gap:22px;padding:22px}} .glass{{background:var(--card);border:1px solid var(--line);box-shadow:var(--shadow);backdrop-filter:blur(20px);border-radius:30px}} aside{{padding:24px;display:flex;flex-direction:column;gap:16px}} .brand{{display:flex;gap:14px;align-items:center}} .logo{{width:58px;height:58px;border-radius:20px;background:conic-gradient(from 220deg,var(--brand),var(--brand2),#60a5fa,var(--brand));display:grid;place-items:center;color:#02111e;font-size:30px;font-weight:1000;box-shadow:0 20px 60px rgba(103,232,249,.32)}} h1{{font-size:24px;line-height:1;margin:0}} .sub,.muted{{color:var(--muted);font-size:13px;line-height:1.45}} .badge{{display:inline-flex;gap:8px;align-items:center;border:1px solid var(--line);background:rgba(255,255,255,.06);padding:8px 11px;border-radius:999px;color:#cffafe;font-size:12px;font-weight:800}} .label{{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:#7dd3fc;font-weight:900;margin-top:8px}} input{{width:100%;border:1px solid var(--line);background:rgba(5,10,20,.72);color:var(--text);border-radius:17px;padding:14px 15px;outline:0}} input:focus{{border-color:rgba(103,232,249,.9);box-shadow:0 0 0 4px rgba(103,232,249,.13)}} .btn{{width:100%;border:1px solid var(--line);background:rgba(22,34,58,.9);color:var(--text);border-radius:17px;padding:14px 16px;font-weight:900;cursor:pointer;transition:.18s transform,.18s filter,.18s box-shadow;text-align:left}} .btn:hover{{transform:translateY(-1px);filter:brightness(1.1);box-shadow:0 14px 34px rgba(0,0,0,.24)}} .primary{{background:linear-gradient(135deg,var(--brand),var(--brand2));color:#03131e}} .danger{{background:linear-gradient(135deg,#fb7185,#f97316);color:#180306}} .good{{background:linear-gradient(135deg,#34d399,#67e8f9);color:#032018}} .main{{display:grid;grid-template-rows:auto auto 1fr;gap:18px;min-width:0}} .hero{{padding:26px 30px;display:flex;justify-content:space-between;align-items:flex-start;gap:24px}} .eyebrow{{color:#67e8f9;font-weight:900;letter-spacing:.14em;text-transform:uppercase;font-size:12px}} .title{{font-size:42px;line-height:.98;font-weight:1000;letter-spacing:-.04em;margin:8px 0}} .lead{{max-width:920px;color:#cbd5e1;font-size:16px;line-height:1.6}} .metrics{{display:grid;grid-template-columns:repeat(5,1fr);gap:14px}} .metric{{padding:16px 18px}} .metric span{{display:block;color:var(--muted);font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.08em}} .metric strong{{display:block;font-size:26px;margin-top:7px}} .workspace{{display:grid;grid-template-columns:minmax(560px,1.25fr) minmax(380px,.75fr);gap:18px;min-height:0}} .panel{{overflow:hidden;display:flex;flex-direction:column;min-height:0}} .toolbar{{display:grid;grid-template-columns:1fr auto auto;gap:10px;padding:16px;border-bottom:1px solid var(--line)}} table{{width:100%;border-collapse:collapse}} th{{text-align:left;color:#93c5fd;font-size:11px;text-transform:uppercase;letter-spacing:.12em;padding:12px 16px;background:rgba(255,255,255,.03)}} td{{padding:14px 16px;border-top:1px solid rgba(148,163,184,.1);font-size:13px;vertical-align:top}} tbody tr{{cursor:pointer;transition:.15s background}} tbody tr:hover,tbody tr.selected{{background:rgba(103,232,249,.08)}} .game{{font-weight:900;font-size:15px}} .pill{{display:inline-flex;border:1px solid rgba(103,232,249,.25);background:rgba(103,232,249,.1);padding:5px 9px;border-radius:999px;font-size:11px;font-weight:850;color:#cffafe}} .confidence{{width:92px;height:8px;background:rgba(148,163,184,.18);border-radius:999px;overflow:hidden}} .confidence i{{display:block;height:100%;background:linear-gradient(90deg,var(--good),var(--brand),var(--brand2))}} .scroll{{overflow:auto;min-height:0}} .detail{{padding:20px;display:grid;gap:14px}} .source{{padding:14px;border-radius:20px;background:rgba(255,255,255,.055);border:1px solid rgba(148,163,184,.14);margin-bottom:10px}} code{{display:block;white-space:normal;word-break:break-all;color:#e0f2fe;margin:8px 0;font-size:12px}} .console{{min-height:105px;max-height:150px;overflow:auto;padding:14px;background:#020617;color:#a7f3d0;border-radius:20px;font-family:ui-monospace,Consolas,monospace;font-size:12px}} .toast{{position:fixed;right:24px;bottom:24px;opacity:0;transform:translateY(12px);transition:.25s;background:#ecfeff;color:#03212a;border-radius:18px;padding:14px 18px;font-weight:900;box-shadow:0 20px 60px rgba(0,0,0,.34)}} .toast.show{{opacity:1;transform:none}} .pulse{{width:10px;height:10px;border-radius:50%;display:inline-block;background:var(--good);box-shadow:0 0 0 6px rgba(52,211,153,.15);margin-right:8px}} @media(max-width:1100px){{body{{overflow:auto}}.app{{height:auto;grid-template-columns:1fr}}.workspace,.metrics{{grid-template-columns:1fr}}}}
-</style></head><body><div id="app-shell" class="app"><aside class="glass"><div class="brand"><div class="logo">M</div><div><h1>MichSaveGame</h1><div class="sub">Former SaveVault Command Center • Universal Game Save Guardian engine</div></div></div><span class="badge">🛡️ local-only • preview-first • quarantined deletes</span><div class="label">Backup destination</div><input id="destination" value="{default_dir}"/><button class="btn primary" data-action="discover" id="discoverBtn">⚡ Discover saves on this PC</button><button class="btn good" id="backupBtn">⬢ Backup selected saves</button><div class="label">C-drive cleanup</div><input id="cleanupGame" placeholder="Game name to clean, e.g. Edge of Eternity"/><button class="btn" id="leftoversBtn">🔎 Find C-drive leftovers</button><button class="btn danger" id="deleteLeftoversBtn">🧹 Delete C-drive leftovers safely</button><button class="btn" id="backupsBtn">Restore Preview / Backups</button><button class="btn" id="clearBtn">Clear selection</button><div class="source"><b><span class="pulse"></span><span id="statusTitle">Ready</span></b><div class="sub" id="statusText">Choose discover, backup, or cleanup. Deletes are backed up to quarantine first.</div></div><div class="console" id="console">Activity Timeline\n</div></aside><main class="main"><section class="hero glass"><div><div class="eyebrow">Beautiful, safe cleanup + save backup</div><div class="title">Protect saves. Remove old game junk. Restore anywhere.</div><div class="lead">MichSaveGame discovers live save locations, creates verifiable backups, previews restore targets, and finds C-drive leftovers for any game you name. Cleanup is intentionally safe: preview first, exact paths visible, server recomputes candidates, and every deletion is quarantined before removal.</div></div></section><section class="metrics"><div class="metric glass"><span>Games found</span><strong id="mGames">—</strong></div><div class="metric glass"><span>Save locations</span><strong id="mLocations">—</strong></div><div class="metric glass"><span>Total save size</span><strong id="mSize">—</strong></div><div class="metric glass"><span>Latest save</span><strong id="mLatest">—</strong></div><div class="metric glass"><span>Leftovers</span><strong id="mLeftovers">—</strong></div></section><section class="workspace"><div class="panel glass"><div class="toolbar"><input id="search" placeholder="Search games, platforms, paths..."/><button class="btn" id="selectAllBtn" style="width:auto">Select visible</button><button class="btn" id="jsonBtn" style="width:auto">Export JSON</button></div><div class="scroll"><table><thead><tr><th></th><th>Game / evidence</th><th>Platform</th><th>Locations</th><th>Size</th><th>Latest</th><th>Confidence</th></tr></thead><tbody id="gamesBody"><tr><td colspan="7">Loading...</td></tr></tbody></table></div></div><div class="panel glass"><div class="detail"><h2 id="detailTitle">Restore Preview</h2><div class="sub" id="detailSub">Backups and cleanup candidates will appear here.</div><div id="sources"></div></div></div></section></main><div class="toast" id="toast"></div></div>
+*{{box-sizing:border-box}} body{{margin:0;min-height:100vh;overflow:auto;color:var(--text);font-family:Inter,Segoe UI,system-ui,sans-serif;background:radial-gradient(circle at 8% 0,rgba(103,232,249,.28),transparent 34%),radial-gradient(circle at 82% 4%,rgba(167,139,250,.24),transparent 32%),linear-gradient(135deg,var(--bg),var(--bg2));}}button,input{{font:inherit}} .app{{min-height:100vh;display:grid;grid-template-columns:324px 1fr;gap:22px;padding:22px}} .glass{{background:var(--card);border:1px solid var(--line);box-shadow:var(--shadow);backdrop-filter:blur(20px);border-radius:30px}} aside{{padding:24px;display:flex;flex-direction:column;gap:16px}} .brand{{display:flex;gap:14px;align-items:center}} .logo{{width:58px;height:58px;border-radius:20px;background:conic-gradient(from 220deg,var(--brand),var(--brand2),#60a5fa,var(--brand));display:grid;place-items:center;color:#02111e;font-size:30px;font-weight:1000;box-shadow:0 20px 60px rgba(103,232,249,.32)}} h1{{font-size:24px;line-height:1;margin:0}} .sub,.muted{{color:var(--muted);font-size:13px;line-height:1.45}} .badge{{display:inline-flex;gap:8px;align-items:center;border:1px solid var(--line);background:rgba(255,255,255,.06);padding:8px 11px;border-radius:999px;color:#cffafe;font-size:12px;font-weight:800}} .label{{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:#7dd3fc;font-weight:900;margin-top:8px}} input{{width:100%;border:1px solid var(--line);background:rgba(5,10,20,.72);color:var(--text);border-radius:17px;padding:14px 15px;outline:0}} input:focus{{border-color:rgba(103,232,249,.9);box-shadow:0 0 0 4px rgba(103,232,249,.13)}} .btn{{width:100%;border:1px solid var(--line);background:rgba(22,34,58,.9);color:var(--text);border-radius:17px;padding:14px 16px;font-weight:900;cursor:pointer;transition:.18s transform,.18s filter,.18s box-shadow;text-align:left}} .btn:hover{{transform:translateY(-1px);filter:brightness(1.1);box-shadow:0 14px 34px rgba(0,0,0,.24)}} .primary{{background:linear-gradient(135deg,var(--brand),var(--brand2));color:#03131e}} .danger{{background:linear-gradient(135deg,#fb7185,#f97316);color:#180306}} .good{{background:linear-gradient(135deg,#34d399,#67e8f9);color:#032018}} .main{{display:grid;grid-template-rows:auto auto minmax(0,1fr);gap:18px;min-width:0;min-height:0}} .hero{{padding:26px 30px;display:flex;justify-content:space-between;align-items:flex-start;gap:24px}} .eyebrow{{color:#67e8f9;font-weight:900;letter-spacing:.14em;text-transform:uppercase;font-size:12px}} .title{{font-size:42px;line-height:.98;font-weight:1000;letter-spacing:-.04em;margin:8px 0}} .lead{{max-width:920px;color:#cbd5e1;font-size:16px;line-height:1.6}} .metrics{{display:grid;grid-template-columns:repeat(5,1fr);gap:14px}} .metric{{padding:16px 18px}} .metric span{{display:block;color:var(--muted);font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.08em}} .metric strong{{display:block;font-size:26px;margin-top:7px}} .workspace{{display:grid;grid-template-columns:minmax(560px,1.25fr) minmax(380px,.75fr);gap:18px;min-height:0}} .panel{{overflow:hidden;display:flex;flex-direction:column;min-height:0}} .toolbar{{display:grid;grid-template-columns:1fr auto auto;gap:10px;padding:16px;border-bottom:1px solid var(--line)}} table{{width:100%;border-collapse:collapse}} th{{text-align:left;color:#93c5fd;font-size:11px;text-transform:uppercase;letter-spacing:.12em;padding:12px 16px;background:rgba(255,255,255,.03)}} td{{padding:14px 16px;border-top:1px solid rgba(148,163,184,.1);font-size:13px;vertical-align:top}} tbody tr{{cursor:pointer;transition:.15s background}} tbody tr:hover,tbody tr.selected{{background:rgba(103,232,249,.08)}} .game{{font-weight:900;font-size:15px}} .pill{{display:inline-flex;border:1px solid rgba(103,232,249,.25);background:rgba(103,232,249,.1);padding:5px 9px;border-radius:999px;font-size:11px;font-weight:850;color:#cffafe}} .confidence{{width:92px;height:8px;background:rgba(148,163,184,.18);border-radius:999px;overflow:hidden}} .confidence i{{display:block;height:100%;background:linear-gradient(90deg,var(--good),var(--brand),var(--brand2))}} .scroll{{overflow:auto;min-height:0;max-height:calc(100vh - 360px)}} .list-meta{{color:var(--muted);font-size:12px;font-weight:800;white-space:nowrap}} .detail{{padding:20px;display:grid;gap:14px}} .source{{padding:14px;border-radius:20px;background:rgba(255,255,255,.055);border:1px solid rgba(148,163,184,.14);margin-bottom:10px}} code{{display:block;white-space:normal;word-break:break-all;color:#e0f2fe;margin:8px 0;font-size:12px}} .console{{min-height:105px;max-height:150px;overflow:auto;padding:14px;background:#020617;color:#a7f3d0;border-radius:20px;font-family:ui-monospace,Consolas,monospace;font-size:12px}} .toast{{position:fixed;right:24px;bottom:24px;opacity:0;transform:translateY(12px);transition:.25s;background:#ecfeff;color:#03212a;border-radius:18px;padding:14px 18px;font-weight:900;box-shadow:0 20px 60px rgba(0,0,0,.34)}} .toast.show{{opacity:1;transform:none}} .pulse{{width:10px;height:10px;border-radius:50%;display:inline-block;background:var(--good);box-shadow:0 0 0 6px rgba(52,211,153,.15);margin-right:8px}} @media(max-width:1100px){{body{{overflow:auto}}.app{{height:auto;grid-template-columns:1fr}}.workspace,.metrics{{grid-template-columns:1fr}}}}
+</style></head><body><div id="app-shell" class="app"><aside class="glass"><div class="brand"><div class="logo">M</div><div><h1>MichSaveGame</h1><div class="sub">Former SaveVault Command Center • Universal Game Save Guardian engine</div></div></div><span class="badge">🛡️ local-only • preview-first • quarantined deletes</span><div class="label">Backup destination</div><input id="destination" value="{default_dir}"/><button class="btn primary" data-action="discover" id="discoverBtn">⚡ Discover saves on this PC</button><button class="btn good" id="backupBtn">⬢ Backup selected saves</button><div class="label">C-drive cleanup</div><input id="cleanupGame" placeholder="Game name to clean, e.g. Edge of Eternity"/><button class="btn" id="leftoversBtn">🔎 Find C-drive leftovers</button><button class="btn danger" id="deleteLeftoversBtn">🧹 Delete typed-game leftovers safely</button><button class="btn danger" id="deleteSelectedBtn">🔥 Delete checked games saves + leftovers</button><button class="btn" id="backupsBtn">Restore Preview / Backups</button><button class="btn" id="clearBtn">Clear selection</button><div class="source"><b><span class="pulse"></span><span id="statusTitle">Ready</span></b><div class="sub" id="statusText">Choose discover, backup, or cleanup. Deletes are quarantined first and removed from the list after deletion.</div></div><div class="console" id="console">Activity Timeline\n</div></aside><main class="main"><section class="hero glass"><div><div class="eyebrow">Beautiful, safe cleanup + save backup</div><div class="title">Protect saves. Remove old game junk. Restore anywhere.</div><div class="lead">MichSaveGame discovers live save locations, creates verifiable backups, previews restore targets, and finds C-drive leftovers for any game you name. Cleanup is intentionally safe: preview first, exact paths visible, server recomputes candidates, and every deletion is quarantined before removal.</div></div></section><section class="metrics"><div class="metric glass"><span>Games found</span><strong id="mGames">—</strong></div><div class="metric glass"><span>Save locations</span><strong id="mLocations">—</strong></div><div class="metric glass"><span>Total save size</span><strong id="mSize">—</strong></div><div class="metric glass"><span>Latest save</span><strong id="mLatest">—</strong></div><div class="metric glass"><span>Leftovers</span><strong id="mLeftovers">—</strong></div></section><section class="workspace"><div class="panel glass"><div class="toolbar"><input id="search" placeholder="Search games, platforms, paths..."/><span class="list-meta" id="listMeta">Loading…</span><button class="btn" id="selectAllBtn" style="width:auto">Select visible</button><button class="btn" id="jsonBtn" style="width:auto">Export JSON</button></div><div class="scroll"><table><thead><tr><th></th><th>Game / evidence</th><th>Platform</th><th>Locations</th><th>Size</th><th>Latest</th><th>Confidence</th></tr></thead><tbody id="gamesBody"><tr><td colspan="7">Loading...</td></tr></tbody></table></div></div><div class="panel glass"><div class="detail"><h2 id="detailTitle">Restore Preview</h2><div class="sub" id="detailSub">Backups and cleanup candidates will appear here.</div><div id="sources"></div></div></div></section></main><div class="toast" id="toast"></div></div>
 <script>
 const API_TOKEN='{api_token}'; let games=[]; let selectedGames=new Set(); let currentFilter=''; let leftovers=[]; const $=id=>document.getElementById(id);
 function toast(msg){{const t=$('toast'); t.textContent=msg; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),3400)}}
@@ -893,7 +1079,7 @@ const authHeaders=()=>({{'X-UGSG-Token':API_TOKEN}}); const jsonHeaders=()=>({{'
 function humanBytes(n){{let u=['B','KB','MB','GB','TB'],i=0,v=n||0;while(v>=1024&&i<u.length-1){{v/=1024;i++}}return i?`${{v.toFixed(1)}} ${{u[i]}}`:`${{v}} B`}} function fmtLatest(x){{return x?String(x).replace('T',' '):'—'}}
 function filtered(){{const q=currentFilter.toLowerCase();return games.filter(g=>!q||g.title.toLowerCase().includes(q)||g.platform.toLowerCase().includes(q)||JSON.stringify(g.sources||[]).toLowerCase().includes(q))}}
 function updateMetrics(){{$('mGames').textContent=games.length;$('mLocations').textContent=games.reduce((a,g)=>a+(g.location_count||0),0);$('mSize').textContent=humanBytes(games.reduce((a,g)=>a+(g.byte_count||0),0));$('mLatest').textContent=fmtLatest(games.map(g=>g.latest_write_iso).filter(Boolean).sort().pop());$('mLeftovers').textContent=leftovers.length||'—'}}
-function renderGames(){{const rows=filtered();$('gamesBody').innerHTML=rows.length?rows.map(g=>`<tr class="${{selectedGames.has(g.title)?'selected':''}}" data-title="${{escapeAttr(g.title)}}"><td>${{selectedGames.has(g.title)?'☑':'☐'}}</td><td><div class="game">${{escapeHtml(g.title)}}</div><div class="muted">${{escapeHtml((g.sources||[])[0]?.reason||'Discovered save group')}}</div></td><td><span class="pill">${{escapeHtml(g.platform||'Heuristic')}}</span></td><td>${{g.location_count||0}}</td><td>${{g.size_human||humanBytes(g.byte_count)}}</td><td>${{fmtLatest(g.latest_write_iso)}}</td><td><div class="confidence"><i style="width:${{g.confidence||0}}%"></i></div><div class="muted">${{g.confidence||0}}%</div></td></tr>`).join(''):`<tr><td colspan="7"><div class="source"><b>No matching games.</b><div class="sub">Try clearing the filter or run Discover again.</div></div></td></tr>`;document.querySelectorAll('tbody tr[data-title]').forEach(r=>r.onclick=()=>selectGame(r.dataset.title));}}
+function renderGames(){{const rows=filtered();$('listMeta').textContent=`Showing ${{rows.length}} of ${{games.length}} save groups`;$('gamesBody').innerHTML=rows.length?rows.map(g=>`<tr class="${{selectedGames.has(g.title)?'selected':''}}" data-title="${{escapeAttr(g.title)}}"><td>${{selectedGames.has(g.title)?'☑':'☐'}}</td><td><div class="game">${{escapeHtml(g.title)}}</div><div class="muted">${{escapeHtml((g.sources||[])[0]?.path_windows||(g.sources||[])[0]?.path||'No path yet')}}</div><div class="muted">${{escapeHtml((g.sources||[])[0]?.reason||'Discovered save group')}}</div></td><td><span class="pill">${{escapeHtml(g.platform||'Heuristic')}}</span></td><td>${{g.location_count||0}}</td><td>${{g.size_human||humanBytes(g.byte_count)}}</td><td>${{fmtLatest(g.latest_write_iso)}}</td><td><div class="confidence"><i style="width:${{g.confidence||0}}%"></i></div><div class="muted">${{g.confidence||0}}%</div></td></tr>`).join(''):`<tr><td colspan="7"><div class="source"><b>No matching games.</b><div class="sub">Try clearing the filter or run Discover again.</div></div></td></tr>`;document.querySelectorAll('tbody tr[data-title]').forEach(r=>r.onclick=()=>selectGame(r.dataset.title));}}
 function selectGame(title){{const g=games.find(x=>x.title===title); if(!g)return; if(selectedGames.has(title))selectedGames.delete(title);else selectedGames.add(title); $('cleanupGame').value=title; renderGames(); renderGameDetail(g)}}
 function renderGameDetail(g){{$('detailTitle').textContent=g.title;$('detailSub').textContent=`${{g.platform}} • ${{g.location_count}} save locations • ${{g.size_human}} • confidence ${{g.confidence}}%`;$('sources').innerHTML=(g.sources||[]).map(s=>`<div class="source"><code>${{escapeHtml(s.path_windows||s.path)}}</code><span class="pill">${{s.confidence}}% confidence</span> <span class="pill">${{escapeHtml(s.size_human)}}</span><p class="sub">${{escapeHtml(s.reason||'Detected save location')}}</p><p class="muted">${{s.file_count}} files • latest ${{fmtLatest(s.latest_write_iso)}}</p></div>`).join('')||'<div class="source">No source details.</div>'}}
 function renderLeftovers(data){{leftovers=data.candidates||[]; updateMetrics(); $('detailTitle').textContent=`Delete all leftovers: ${{escapeHtml(data.game||'game')}}`; $('detailSub').textContent=`${{leftovers.length}} C-drive candidate folders found. Review paths; actual deletion quarantines first.`; $('sources').innerHTML=leftovers.map(c=>`<div class="source"><b>${{escapeHtml(c.category||'leftover')}}</b><code>${{escapeHtml(c.path_windows||c.path)}}</code><span class="pill">${{escapeHtml(c.size_human)}}</span> <span class="pill">${{c.file_count}} files</span><p class="sub">${{escapeHtml(c.reason)}} • quarantine before delete</p></div>`).join('')||'<div class="source">No C-drive leftovers found for that game.</div>'}}
@@ -901,8 +1087,9 @@ async function discover(refresh=true){{status('Scanning','Indexing drives, users
 async function loadBackups(){{const data=await (await fetch('/api/backups',{{headers:authHeaders()}})).json(); $('detailTitle').textContent='Restore Preview'; $('detailSub').textContent=`${{data.count}} backups found in ${{data.default_backup_dir}}`; $('sources').innerHTML=(data.backups||[]).map(b=>`<div class="source"><b>${{escapeHtml(b.game||'Unknown')}}</b><code>${{escapeHtml(b.path_windows||b.path)}}</code><span class="pill">${{escapeHtml(b.size_human)}}</span><p class="muted">${{escapeHtml(b.created_at)}} • ${{escapeHtml(b.sources)}} sources</p></div>`).join('')||'<div class="source">No backups found yet.</div>'; status('Backup browser','Loaded restore-preview backup list')}}
 async function backupSelected(){{const selectedTitles=[...selectedGames]; if(!selectedTitles.length){{toast('Select at least one game first');return}} status('Backing up',`Creating backups for ${{selectedTitles.length}} games...`); const res=await fetch('/api/backup',{{method:'POST',headers:jsonHeaders(),body:JSON.stringify({{destination:$('destination').value,titles:selectedTitles}})}}); const data=await res.json(); if(!data.ok){{toast(data.error||'Backup failed');status('Backup failed',data.error||'Unknown error');return}} toast('Backup complete'); status('Backup complete',data.backups.map(b=>b.path_windows).join(' • ')); await loadBackups()}}
 async function findLeftovers(){{const game=$('cleanupGame').value.trim(); if(!game){{toast('Type a game name or select one first');return}} status('Scanning C drive',`Looking for leftovers for ${{game}}...`); const data=await (await fetch('/api/leftovers?game='+encodeURIComponent(game),{{headers:authHeaders()}})).json(); renderLeftovers(data); status('Cleanup preview',`${{data.count||0}} leftover folders found for ${{game}}`)}}
-async function deleteLeftovers(){{const game=$('cleanupGame').value.trim(); if(!game){{toast('Type a game name first');return}} if(!leftovers.length){{toast('Run Find C-drive leftovers first');return}} if(!confirm('Delete the previewed leftover folders for '+game+'? They will be copied to quarantine first.')) return; status('Deleting safely','Quarantining then removing previewed C-drive leftovers...'); const res=await fetch('/api/delete-leftovers',{{method:'POST',headers:jsonHeaders(),body:JSON.stringify({{game,execute:true,candidate_ids:leftovers.map(c=>c.id)}})}}); const data=await res.json(); renderLeftovers(data); toast(`Deleted ${{data.count||0}} leftover folders`); status('Cleanup complete',`${{data.count||0}} folders quarantined at ${{data.quarantine_path_windows||''}}`)}}
-$('discoverBtn').onclick=()=>discover(true);$('backupBtn').onclick=backupSelected;$('backupsBtn').onclick=loadBackups;$('leftoversBtn').onclick=findLeftovers;$('deleteLeftoversBtn').onclick=deleteLeftovers;$('selectAllBtn').onclick=()=>{{filtered().forEach(g=>selectedGames.add(g.title));renderGames();toast('Visible games selected')}};$('clearBtn').onclick=()=>{{selectedGames.clear();renderGames();toast('Selection cleared')}};$('jsonBtn').onclick=()=>{{const blob=new Blob([JSON.stringify({{games,leftovers}},null,2)],{{type:'application/json'}});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='MichSaveGame-discovery.json';a.click()}};$('search').oninput=e=>{{currentFilter=e.target.value;renderGames()}};loadBackups();discover(true);
+async function deleteLeftovers(){{const game=$('cleanupGame').value.trim(); if(!game){{toast('Type a game name first');return}} if(!leftovers.length){{toast('Run Find leftovers first');return}} if(!confirm('Delete the previewed leftover folders for '+game+'? They will be copied to quarantine first.')) return; status('Deleting safely','Quarantining then removing previewed leftovers...'); const res=await fetch('/api/delete-leftovers',{{method:'POST',headers:jsonHeaders(),body:JSON.stringify({{game,execute:true,candidate_ids:leftovers.map(c=>c.id)}})}}); const data=await res.json(); renderLeftovers(data); toast(`Deleted ${{data.count||0}} leftover folders`); status('Cleanup complete',`${{data.count||0}} folders quarantined at ${{data.quarantine_path_windows||''}}`); games=games.filter(g=>g.title!==game); selectedGames.delete(game); renderGames(); updateMetrics()}}
+async function deleteSelectedGames(){{const selectedTitles=[...selectedGames]; if(!selectedTitles.length){{toast('Check at least one game first');return}} if(!confirm('Delete ALL save data and related leftovers for '+selectedTitles.length+' checked game(s)? Everything is copied to quarantine first.')) return; status('Deleting checked games','Quarantining saves and leftovers, then freeing C drive...'); const res=await fetch('/api/delete-selected',{{method:'POST',headers:jsonHeaders(),body:JSON.stringify({{titles:selectedTitles}})}}); const data=await res.json(); if(!data.ok){{toast(data.error||'Delete failed');status('Delete failed',data.error||'Unknown error');return}} const deleted=new Set(data.deleted_games||selectedTitles); games=games.filter(g=>!deleted.has(g.title)); selectedGames.clear(); leftovers=[]; updateMetrics(); renderGames(); $('detailTitle').textContent='Deleted checked games'; $('detailSub').textContent=`${{deleted.size}} game(s) removed from list. Quarantine paths are shown below.`; $('sources').innerHTML=(data.results||[]).map(r=>`<div class="source"><b>${{escapeHtml(r.game)}}</b><code>${{escapeHtml(r.quarantine_path_windows||r.quarantine_path)}}</code><p class="sub">${{(r.save_actions||[]).length}} save location(s), ${{r.leftover_cleanup?.count||0}} leftover folder(s) quarantined then deleted.</p></div>`).join(''); toast('Checked game saves deleted'); status('Delete complete',`${{deleted.size}} checked game(s) removed from the list`)}}
+$('discoverBtn').onclick=()=>discover(true);$('backupBtn').onclick=backupSelected;$('backupsBtn').onclick=loadBackups;$('leftoversBtn').onclick=findLeftovers;$('deleteLeftoversBtn').onclick=deleteLeftovers;$('deleteSelectedBtn').onclick=deleteSelectedGames;$('selectAllBtn').onclick=()=>{{filtered().forEach(g=>selectedGames.add(g.title));renderGames();toast('Visible games selected')}};$('clearBtn').onclick=()=>{{selectedGames.clear();renderGames();toast('Selection cleared')}};$('jsonBtn').onclick=()=>{{const blob=new Blob([JSON.stringify({{games,leftovers}},null,2)],{{type:'application/json'}});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='MichSaveGame-discovery.json';a.click()}};$('search').oninput=e=>{{currentFilter=e.target.value;renderGames()}};loadBackups();discover(true);
 </script></body></html>'''
 
 class Web(BaseHTTPRequestHandler):
@@ -913,12 +1100,25 @@ class Web(BaseHTTPRequestHandler):
         if origin and not (origin.startswith('http://127.0.0.1:') or origin.startswith('http://localhost:')):
             return False
         return True
+    def log_message(self, format, *args):
+        return
+    def _send_bytes(self, data: bytes, status_code: int = 200, content_type: str = 'application/octet-stream') -> bool:
+        try:
+            self.send_response(status_code); self.send_header('Content-Type', content_type); self.send_header('Content-Length', str(len(data))); self.end_headers(); self.wfile.write(data)
+            return True
+        except CLIENT_ABORT_EXCEPTIONS:
+            return False
     def _json(self, obj: dict, status_code: int = 200) -> None:
         data = json.dumps(obj, indent=2).encode('utf-8')
-        self.send_response(status_code); self.send_header('Content-Type', 'application/json; charset=utf-8'); self.send_header('Content-Length', str(len(data))); self.end_headers(); self.wfile.write(data)
+        self._send_bytes(data, status_code, 'application/json; charset=utf-8')
     def _html(self, body: str) -> None:
         data = body.encode('utf-8')
-        self.send_response(200); self.send_header('Content-Type','text/html; charset=utf-8'); self.send_header('Content-Length', str(len(data))); self.end_headers(); self.wfile.write(data)
+        self._send_bytes(data, 200, 'text/html; charset=utf-8')
+    def _empty(self, status_code: int = 204) -> None:
+        try:
+            self.send_response(status_code); self.send_header('Content-Length','0'); self.end_headers()
+        except CLIENT_ABORT_EXCEPTIONS:
+            pass
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         try:
@@ -935,8 +1135,12 @@ class Web(BaseHTTPRequestHandler):
                     self._json({'ok': False, 'error': 'Unauthorized local request'}, 403); return
                 qs = urllib.parse.parse_qs(parsed.query); self._json(api_leftovers(qs.get('game', [''])[0]))
             elif parsed.path in ('/', '/discover', '/app'): self._html(render_app_shell())
+            elif parsed.path == '/favicon.ico': self._empty(204)
             else: self._json({'ok': False, 'error': 'Not found'}, 404)
-        except Exception as exc: self._json({'ok': False, 'error': str(exc)}, 500)
+        except CLIENT_ABORT_EXCEPTIONS:
+            return
+        except Exception as exc:
+            self._json({'ok': False, 'error': str(exc)}, 500)
     def do_POST(self):
         try:
             if not self._authorized():
@@ -944,8 +1148,12 @@ class Web(BaseHTTPRequestHandler):
             length = int(self.headers.get('Content-Length') or '0'); payload = json.loads(self.rfile.read(length).decode('utf-8') or '{}')
             if self.path == '/api/backup': self._json(api_backup_selected(payload))
             elif self.path == '/api/delete-leftovers': self._json(api_cleanup_leftovers(payload))
+            elif self.path == '/api/delete-selected': self._json(api_delete_selected(payload))
             else: self._json({'ok': False, 'error': 'Not found'}, 404)
-        except Exception as exc: self._json({'ok': False, 'error': str(exc)}, 500)
+        except CLIENT_ABORT_EXCEPTIONS:
+            return
+        except Exception as exc:
+            self._json({'ok': False, 'error': str(exc)}, 500)
 
 def local_app_url(port: int) -> str:
     return f'http://127.0.0.1:{port}/app'
