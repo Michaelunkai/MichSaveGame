@@ -18,5 +18,6 @@ if (-not $PythonCommand) {
     exit 1
 }
 
+if ($args.Count -eq 0) { $args = @('gui') }
 & $PythonCommand[0] @($PythonCommand[1..($PythonCommand.Count - 1)]) "$Root\michsavegame.py" @args
 exit $LASTEXITCODE

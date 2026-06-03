@@ -2,7 +2,7 @@
 #!/usr/bin/env python3
 """MichSaveGame: premium local CLI and browser app for save backup, restore, and cleanup."""
 from __future__ import annotations
-import argparse, base64, dataclasses, datetime as dt, fnmatch, hashlib, html, json, os, queue, re, secrets, shutil, sys, tarfile, tempfile, threading, time, urllib.parse, urllib.request, webbrowser
+import argparse, base64, dataclasses, datetime as dt, fnmatch, hashlib, html, json, os, queue, re, secrets, shutil, socket, sys, tarfile, tempfile, threading, time, urllib.parse, urllib.request, webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterable, Optional
@@ -809,15 +809,61 @@ class Web(BaseHTTPRequestHandler):
             else: self._json({'ok': False, 'error': 'Not found'}, 404)
         except Exception as exc: self._json({'ok': False, 'error': str(exc)}, 500)
 
+def local_app_url(port: int) -> str:
+    return f'http://127.0.0.1:{port}/app'
+
+def port_looks_like_michsavegame(port: int) -> bool:
+    try:
+        with urllib.request.urlopen(local_app_url(port), timeout=1.5) as response:
+            return b'MichSaveGame' in response.read(12000)
+    except Exception:
+        return False
+
+def available_port(preferred: int, fallbacks: Iterable[int] | None = None) -> int:
+    candidates = [preferred] + list(fallbacks or [8787, 8877, 8995, 52117, 52118, 52119])
+    for candidate in candidates:
+        if port_looks_like_michsavegame(candidate):
+            return candidate
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind(('127.0.0.1', candidate))
+            return candidate
+        except OSError:
+            continue
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(('127.0.0.1', 0))
+        return int(sock.getsockname()[1])
+
 def serve(port:int, open_browser: bool = True):
-    http=ThreadingHTTPServer(('127.0.0.1', port), Web); url=f'http://127.0.0.1:{port}/app'; print(f'MichSaveGame local app {url}', flush=True)
-    if open_browser: webbrowser.open(url)
-    http.serve_forever()
+    tried=[]
+    for requested in [port, 8787, 8877, 8995, 52117, 52118, 52119, 0]:
+        selected_port = requested if requested == 0 else available_port(requested)
+        url = local_app_url(selected_port)
+        if port_looks_like_michsavegame(selected_port):
+            print(f'MichSaveGame already running {url}', flush=True)
+            if open_browser: webbrowser.open(url)
+            return
+        try:
+            http=ThreadingHTTPServer(('127.0.0.1', selected_port), Web)
+            actual_port = int(http.server_address[1])
+            url = local_app_url(actual_port)
+            print(f'MichSaveGame local app {url}', flush=True)
+            if open_browser: webbrowser.open(url)
+            http.serve_forever()
+            return
+        except OSError as exc:
+            tried.append(f'{selected_port}:{exc}')
+            continue
+    raise OSError('Could not bind MichSaveGame local server. Tried ' + '; '.join(tried))
 
 def launch_gui():
     serve(8765, open_browser=True)
 
 def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:
+        argv = ['gui']
     p=argparse.ArgumentParser(description=APP_NAME); sub=p.add_subparsers(required=True)
     d=sub.add_parser('discover',aliases=['discover-all']); d.add_argument('--game'); d.add_argument('--all',action='store_true'); d.add_argument('--json',action='store_true'); d.add_argument('--refresh',action='store_true'); d.set_defaults(func=cmd_discover)
     b=sub.add_parser('backup'); b.add_argument('--game'); b.add_argument('--destination'); b.add_argument('--all',action='store_true'); b.add_argument('--refresh',action='store_true'); b.set_defaults(func=cmd_backup)
@@ -830,6 +876,6 @@ def main(argv=None):
     g=sub.add_parser('gui'); g.set_defaults(func=lambda a: launch_gui())
     w=sub.add_parser('web'); w.add_argument('--port',type=int,default=8765); w.set_defaults(func=lambda a: serve(a.port))
     args=p.parse_args(argv)
-    if len(sys.argv)>1 and sys.argv[1]=='discover-all': setattr(args,'all',True)
+    if argv and argv[0]=='discover-all': setattr(args,'all',True)
     args.func(args)
 if __name__=='__main__': main()

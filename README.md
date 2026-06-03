@@ -24,8 +24,10 @@ Each backup gets its own timestamped folder. Every cleanup delete is preview-fir
 From PowerShell:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "F:\study\Windows\Applications\Gaming\SaveData\Backup\Tools\Python\MichSaveGame\scripts\run-MichSaveGame.ps1" gui
+& 'F:\study\Windows\Applications\Gaming\SaveData\Backup\Tools\Python\MichSaveGame\run-MichSaveGame.ps1'
 ```
+
+The runner now defaults to `gui`, so no argument is required. If port `8765` is blocked or already used by Windows, MichSaveGame automatically picks the next safe local port and opens that URL.
 
 The local dashboard opens at:
 
