@@ -90,7 +90,7 @@ Then open `http://127.0.0.1:8765`.
 - `game-save-guardian.py` — main runnable CLI/GUI/web entry point.
 - `gamesave_guardian/app.py` — application logic.
 - `scripts/run-game-save-guardian.ps1` — PowerShell runner.
-- `data/ludusavi_manifest.yaml` — bundled public Ludusavi manifest snapshot.
+- `data/ludusavi_manifest.yaml` — optional local cache downloaded on first use. It is intentionally ignored by Git because public manifest snapshots can trigger provider secret-scanning false positives.
 
 ## Troubleshooting
 
